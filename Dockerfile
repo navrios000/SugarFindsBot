@@ -24,24 +24,20 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Instalar dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium de Playwright
 RUN playwright install chromium
 
-# Copiar aplicación
 COPY bot.py config.py ./
 COPY handlers/ ./handlers/
 COPY utils/ ./utils/
+COPY product_processor/ ./product_processor/
 COPY inspect_sugargoo.py ./
+COPY inspect_weidian.py ./
 
-# Usuario no privilegiado
 RUN useradd --create-home --shell /bin/bash appuser
-
-# Dar acceso al navegador descargado
-RUN chown -R appuser:appuser /home/appuser
+RUN chown -R appuser:appuser /app /home/appuser
 
 USER appuser
 
