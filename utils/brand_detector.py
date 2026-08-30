@@ -1,226 +1,277 @@
 
-"""Detector de marcas a partir de nombres e imágenes de productos."""
+"""Adaptador de Weidian.
 
-import base64
-import json
-import logging
-import os
-from urllib.request import Request, urlopen
+Extrae nombre, precio e imágenes directamente del HTML público de Weidian.
+Además intenta detectar la marca:
+1. Por el nombre del producto.
+2. Si no aparece, mediante la primera imagen usando OpenAI Vision.
+"""
 
-logger = logging.getLogger("sugarfinds")
+import html as html_lib
+import re
 
-# Marcas frecuentes en productos de moda/streetwear.
-KNOWN_BRANDS = [
-    "ADIDAS",
-    "ALEXANDER MCQUEEN",
-    "AMIRI",
-    "ARC'TERYX",
-    "ASICS",
-    "BALENCIAGA",
-    "BAPE",
-    "BOTTEGA VENETA",
-    "BURBERRY",
-    "CARHARTT",
-    "CELINE",
-    "CHANEL",
-    "CHROME HEARTS",
-    "DIOR",
-    "DOLCE & GABBANA",
-    "ESSENTIALS",
-    "FEAR OF GOD",
-    "FOG ESSENTIALS",
-    "GIVENCHY",
-    "GUCCI",
-    "HERMÈS",
-    "JORDAN",
-    "LACOSTE",
-    "LOUIS VUITTON",
-    "MAISON MARGIELA",
-    "MONCLER",
-    "MONCLER GENIUS",
-    "NEW BALANCE",
-    "NIKE",
-    "OFF-WHITE",
-    "PALM ANGELS",
-    "PRADA",
-    "RALPH LAUREN",
-    "RICK OWENS",
-    "SALOMON",
-    "STONE ISLAND",
-    "SUPREME",
-    "THE NORTH FACE",
-    "THOM BROWNE",
-    "TRAVIS SCOTT",
-    "UNIQLO",
-    "VETEMENTS",
-    "VERSACE",
-    "YEEZY",
-]
+import aiohttp
 
+from product_processor.base import ProductFetchError
+from utils.brand_detector import detect_brand_from_image, detect_brand_from_name
+from utils.product_data import ProductData
 
-def detect_brand_from_name(name: str) -> str:
-    """Intenta detectar una marca conocida directamente en el nombre."""
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
 
-    if not name:
-        return ""
+_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
-    normalized = " ".join(name.upper().replace("_", " ").split())
+# --- Nombre: item_name en el JSON embebido ---
 
-    # Primero buscamos nombres completos para evitar coincidencias
-    # parciales incorrectas.
-    for brand in sorted(KNOWN_BRANDS, key=len, reverse=True):
-        if brand in normalized:
-            return brand
+_ITEM_NAME_ESCAPED_RE = re.compile(
+    r"item_name&#34;\s*:\s*&#34;(.*?)&#34;"
+)
 
-    # Alias habituales.
-    aliases = {
-        "MM6": "MAISON MARGIELA",
-        "MARGIELA": "MAISON MARGIELA",
-        "TNF": "THE NORTH FACE",
-        "NORTHFACE": "THE NORTH FACE",
-        "STONEISLAND": "STONE ISLAND",
-        "CHROMEHEARTS": "CHROME HEARTS",
-        "RICKOWENS": "RICK OWENS",
-        "OFFWHITE": "OFF-WHITE",
-        "MONCLER": "MONCLER",
-        "ESSENTIALS": "ESSENTIALS",
-        "FOG": "FEAR OF GOD",
-    }
+_ITEM_NAME_NORMAL_RE = re.compile(
+    r'"item_name"\s*:\s*"(.*?)"'
+)
 
-    compact = normalized.replace(" ", "")
+# --- Precio ---
 
-    for alias, brand in aliases.items():
-        if alias in compact:
-            return brand
+_ITEM_LOW_PRICE_ESCAPED_RE = re.compile(
+    r"itemLowPrice&#34;\s*:\s*(\d+)"
+)
 
-    return ""
+_ITEM_LOW_PRICE_NORMAL_RE = re.compile(
+    r'"itemLowPrice"\s*:\s*(\d+)'
+)
+
+_PRICE_FIELD_ESCAPED_RE = re.compile(
+    r"(?<!Low)price&#34;\s*:\s*&#34;([\d.]+)&#34;",
+    re.IGNORECASE,
+)
+
+_PRICE_FIELD_NORMAL_RE = re.compile(
+    r'(?<!Low)"price"\s*:\s*"([\d.]+)"',
+    re.IGNORECASE,
+)
+
+_ORIGIN_PRICE_ESCAPED_RE = re.compile(
+    r"origin_price&#34;\s*:\s*&#34;([\d.]+)&#34;"
+)
+
+_ORIGIN_PRICE_NORMAL_RE = re.compile(
+    r'"origin_price"\s*:\s*"([\d.]+)"'
+)
+
+# --- Imágenes ---
+
+_IMG_URL_RE = re.compile(
+    r'https://[a-zA-Z0-9.\-]*geilicdn\.com/[^\s"\'&)]+\.(?:jpg|jpeg|png|webp)',
+    re.IGNORECASE,
+)
+
+_DIMENSION_SUFFIX_RE = re.compile(
+    r"_(\d+)_(\d+)\.(?:jpg|jpeg|png|webp)$",
+    re.IGNORECASE,
+)
+
+# Assets que NO son fotos del producto.
+_JUNK_KEYWORDS = (
+    "unadjust",
+    "hz_img",
+    "default",
+    "headimg",
+    "logo",
+)
+
+_MIN_IMAGE_DIMENSION = 200
+
+_MAX_IMAGES = 9
 
 
-async def detect_brand_from_image(image_url: str) -> str:
-    """
-    Analiza una imagen de producto con OpenAI Vision.
-
-    Devuelve únicamente una marca reconocible.
-    Si no puede identificarla con suficiente confianza, devuelve "".
-    """
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key or not image_url:
-        return ""
+async def fetch(product_url: str) -> ProductData:
+    """Descarga y parsea la página pública de un producto de Weidian."""
 
     try:
-        image_data = _download_image(image_url)
+        async with aiohttp.ClientSession(
+            headers=_HEADERS,
+            timeout=_TIMEOUT,
+        ) as session:
 
-        if not image_data:
-            return ""
+            async with session.get(product_url) as resp:
 
-        image_b64 = base64.b64encode(image_data).decode("ascii")
+                if resp.status != 200:
+                    raise ProductFetchError(
+                        f"Weidian devolvió status {resp.status} "
+                        f"para {product_url}"
+                    )
 
-        payload = {
-            "model": "gpt-4.1-mini",
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "Identify the clothing or fashion brand visible "
-                                "in this product image. Look carefully for logos, "
-                                "text, symbols and distinctive branding. "
-                                "Return ONLY the brand name if you are confident. "
-                                "If there is no recognizable brand, return exactly "
-                                "NONE. Do not guess."
-                            ),
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": (
-                                f"data:image/jpeg;base64,{image_b64}"
-                            ),
-                        },
-                    ],
-                }
-            ],
-            "max_output_tokens": 30,
-        }
+                page_html = await resp.text()
 
-        result = _openai_request(api_key, payload)
+    except aiohttp.ClientError as e:
+        raise ProductFetchError(
+            f"Error de red al pedir {product_url}: {e}"
+        ) from e
 
-        brand = _extract_response_text(result)
-        brand = brand.strip().upper()
+    # Comprobar si Weidian redirigió a login/register.
+    head = page_html[:3000].lower()
 
-        if not brand or brand == "NONE":
-            return ""
+    if (
+        "login.taobao" in head
+        or "/register" in head
+        or "<title>register</title>" in head
+    ):
+        raise ProductFetchError(
+            "Weidian redirigió a login/register para este producto: "
+            "la vista pública no está disponible."
+        )
 
-        # Si la API devuelve una explicación en vez de solo la marca,
-        # intentamos quedarnos con una marca conocida.
-        detected = detect_brand_from_name(brand)
+    # Extraer datos.
+    name = _extract_name(page_html)
+    price = _extract_price(page_html)
+    images = _extract_images(page_html)
 
-        if detected:
-            return detected
+    if not name or not price:
+        raise ProductFetchError(
+            "No se pudo extraer nombre y/o precio del HTML de Weidian "
+            "(puede que haya cambiado la estructura de la página; "
+            "usa inspect_weidian.py para revisar el HTML actual)."
+        )
 
-        # También aceptamos una marca que no esté en nuestra lista,
-        # siempre que la respuesta sea corta y parezca un nombre.
-        if len(brand) <= 40 and "\n" not in brand:
-            return brand
+    # ---------------------------------------------------------
+    # DETECCIÓN DE MARCA
+    # ---------------------------------------------------------
 
-        return ""
+    # Primero intentamos detectar la marca directamente en el nombre.
+    brand = detect_brand_from_name(name)
 
-    except Exception:
-        logger.exception("Error detectando marca desde imagen")
-        return ""
+    # Si el nombre no contiene una marca reconocible,
+    # analizamos la primera imagen del producto.
+    if not brand and images:
+        brand = await detect_brand_from_image(images[0])
 
+    # Si hemos encontrado una marca, la colocamos delante.
+    if brand:
+        if brand.upper() not in name.upper():
+            name = f"{brand} {name}"
 
-def _download_image(url: str) -> bytes:
-    """Descarga una imagen con un User-Agent de navegador."""
+    # ---------------------------------------------------------
 
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-            )
-        },
+    return ProductData(
+        source_url=product_url,
+        platform="weidian",
+        name=name,
+        price=f"¥{price}",
+        images=images,
     )
 
-    with urlopen(request, timeout=15) as response:
-        return response.read()
 
+def _extract_name(page_html: str) -> str:
+    """Extrae el nombre original del producto."""
 
-def _openai_request(api_key: str, payload: dict) -> dict:
-    """Hace una petición directa a la Responses API de OpenAI."""
-
-    body = json.dumps(payload).encode("utf-8")
-
-    request = Request(
-        "https://api.openai.com/v1/responses",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
+    match = (
+        _ITEM_NAME_ESCAPED_RE.search(page_html)
+        or _ITEM_NAME_NORMAL_RE.search(page_html)
     )
 
-    with urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    if not match:
+        return ""
+
+    return html_lib.unescape(match.group(1)).strip()
 
 
-def _extract_response_text(result: dict) -> str:
-    """Extrae el texto de respuesta de la Responses API."""
+def _format_amount(amount: float) -> str:
+    """Formatea un precio en yuanes."""
 
-    if isinstance(result.get("output_text"), str):
-        return result["output_text"]
+    if amount == int(amount):
+        return str(int(amount))
 
-    output = result.get("output", [])
+    return f"{amount:.2f}"
 
-    for item in output:
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                return content.get("text", "")
+
+def _extract_price(page_html: str) -> str:
+    """Extrae el precio usando varias fuentes de respaldo."""
+
+    # 1. itemLowPrice.
+    # Viene en céntimos de yuan.
+    match = (
+        _ITEM_LOW_PRICE_ESCAPED_RE.search(page_html)
+        or _ITEM_LOW_PRICE_NORMAL_RE.search(page_html)
+    )
+
+    if match:
+        cents = int(match.group(1))
+        return _format_amount(cents / 100)
+
+    # 2. price.
+    match = (
+        _PRICE_FIELD_ESCAPED_RE.search(page_html)
+        or _PRICE_FIELD_NORMAL_RE.search(page_html)
+    )
+
+    if match:
+        return _format_amount(float(match.group(1)))
+
+    # 3. origin_price.
+    match = (
+        _ORIGIN_PRICE_ESCAPED_RE.search(page_html)
+        or _ORIGIN_PRICE_NORMAL_RE.search(page_html)
+    )
+
+    if match:
+        return _format_amount(float(match.group(1)))
 
     return ""
 
+
+def _extract_images(page_html: str) -> list[str]:
+    """Extrae las fotos reales del producto."""
+
+    images: list[str] = []
+    seen_keys: set[str] = set()
+
+    for match in _IMG_URL_RE.finditer(page_html):
+
+        url = match.group(0).split("?")[0]
+        url_lower = url.lower()
+
+        # Eliminar iconos, logos, avatares y banners.
+        if any(
+            keyword in url_lower
+            for keyword in _JUNK_KEYWORDS
+        ):
+            continue
+
+        # Comprobar dimensiones cuando existen.
+        dim_match = _DIMENSION_SUFFIX_RE.search(url)
+
+        if dim_match:
+
+            width = int(dim_match.group(1))
+            height = int(dim_match.group(2))
+
+            if (
+                width < _MIN_IMAGE_DIMENSION
+                or height < _MIN_IMAGE_DIMENSION
+            ):
+                continue
+
+        # Evitar imágenes duplicadas.
+        dedup_key = (
+            url_lower[:-len(".webp")]
+            if url_lower.endswith(".webp")
+            else url_lower
+        )
+
+        if dedup_key in seen_keys:
+            continue
+
+        seen_keys.add(dedup_key)
+        images.append(url)
+
+        if len(images) >= _MAX_IMAGES:
+            break
+
+    return images
