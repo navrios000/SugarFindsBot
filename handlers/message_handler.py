@@ -1,3 +1,4 @@
+
 """Handler de mensajes: detecta enlaces, genera el FIND y lo publica."""
 
 import logging
@@ -13,7 +14,6 @@ from utils.affiliate import (
 )
 from utils.find_formatter import build_find_caption
 from utils.link_parser import Platform, find_product_link
-from utils.name_cleaner import clean_product_name
 from utils.pricing import cny_to_eur
 
 
@@ -44,7 +44,91 @@ def build_message_handler(config):
             )
             return
 
-        link_match = find_product_link(message.text)
+        # ─────────────────────────────────────────
+        # SI ESTAMOS ESPERANDO EL NOMBRE
+        # ─────────────────────────────────────────
+
+        pending_product = context.user_data.get(
+            "pending_product"
+        )
+
+        if pending_product:
+            name = message.text.strip()
+
+            if not name:
+                await message.reply_text(
+                    "❌ El nombre no puede estar vacío. "
+                    "Escribe el nombre que quieres usar."
+                )
+                return
+
+            pending_product.name = name
+
+            context.user_data.pop(
+                "pending_product",
+                None,
+            )
+
+            caption = build_find_caption(
+                pending_product
+            )
+
+            try:
+
+                if pending_product.images:
+
+                    media = [
+                        InputMediaPhoto(url)
+                        for url in pending_product.images
+                    ]
+
+                    media[0] = InputMediaPhoto(
+                        media[0].media,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+
+                    await context.bot.send_media_group(
+                        chat_id=CHANNEL_ID,
+                        media=media,
+                    )
+
+                else:
+
+                    await context.bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=caption,
+                        parse_mode="HTML",
+                    )
+
+                await message.reply_text(
+                    "✅ FIND publicado en el canal."
+                )
+
+                logger.info(
+                    "FIND publicado correctamente."
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Error al publicar el FIND en el canal"
+                )
+
+                await message.reply_text(
+                    "Hubo un error al publicar "
+                    "el FIND en el canal."
+                )
+
+            return
+
+        # ─────────────────────────────────────────
+        # DETECTAR LINK
+        # ─────────────────────────────────────────
+
+        link_match = find_product_link(
+            message.text
+        )
 
         if link_match is None:
             return
@@ -66,17 +150,26 @@ def build_message_handler(config):
             )
             return
 
+        # ─────────────────────────────────────────
+        # OBTENER PRODUCTO
+        # ─────────────────────────────────────────
+
         try:
+
             product = await process(
                 platform,
                 product_url,
             )
 
         except UnsupportedPlatformError as e:
-            await message.reply_text(str(e))
+
+            await message.reply_text(
+                str(e)
+            )
             return
 
         except ProductFetchError as e:
+
             logger.exception(
                 "Fallo al procesar %s",
                 product_url,
@@ -88,12 +181,8 @@ def build_message_handler(config):
             return
 
         # ─────────────────────────────────────────
-        # LIMPIEZA DEL PRODUCTO
+        # PRECIO
         # ─────────────────────────────────────────
-
-        product.name = clean_product_name(
-            product.name
-        )
 
         product.price = cny_to_eur(
             product.price,
@@ -127,6 +216,7 @@ def build_message_handler(config):
         )
 
         if not product.usfans_url:
+
             logger.warning(
                 "No se pudo generar el enlace de "
                 "producto de USFans para %s",
@@ -134,61 +224,20 @@ def build_message_handler(config):
             )
 
         # ─────────────────────────────────────────
-        # CAPTION
+        # GUARDAR PRODUCTO Y PEDIR NOMBRE
         # ─────────────────────────────────────────
 
-        caption = build_find_caption(product)
+        context.user_data[
+            "pending_product"
+        ] = product
 
-        # ─────────────────────────────────────────
-        # PUBLICACIÓN
-        # ─────────────────────────────────────────
-
-        try:
-
-            if product.images:
-
-                media = [
-                    InputMediaPhoto(url)
-                    for url in product.images
-                ]
-
-                media[0] = InputMediaPhoto(
-                    media[0].media,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-
-                await context.bot.send_media_group(
-                    chat_id=CHANNEL_ID,
-                    media=media,
-                )
-
-            else:
-
-                await context.bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=caption,
-                    parse_mode="HTML",
-                )
-
-            await message.reply_text(
-                "✅ FIND publicado en el canal."
-            )
-
-            logger.info(
-                "FIND publicado correctamente para %s",
-                product_url,
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Error al publicar el FIND en el canal"
-            )
-
-            await message.reply_text(
-                "Hubo un error al publicar "
-                "el FIND en el canal."
-            )
+        await message.reply_text(
+            "🏷️ ¿Qué nombre quieres ponerle al FIND?\n\n"
+            "Escribe exactamente el nombre que quieres "
+            "que aparezca.\n\n"
+            "Ejemplo:\n"
+            "Maison Margiela Weight Cotton T-Shirt"
+        )
 
     return handle_message
+
