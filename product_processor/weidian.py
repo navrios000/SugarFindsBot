@@ -1,4 +1,4 @@
-```python
+
 """Adaptador de Weidian.
 
 Descarga nombre, precio e imágenes de un producto de Weidian y, cuando
@@ -297,4 +297,3 @@ def _build_name_with_brand(raw_name: str, brand: str) -> str:
         return raw_name
 
     return f"{brand} {raw_name}"
-```
