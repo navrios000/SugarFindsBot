@@ -1,4 +1,3 @@
-
 """Handler de mensajes: detecta enlaces, genera el FIND y lo publica."""
 
 import logging
@@ -36,6 +35,21 @@ def build_message_handler(config):
 
         user = update.effective_user
 
+        # ─────────────────────────────────────────
+        # DIAGNÓSTICO
+        # ─────────────────────────────────────────
+
+        logger.info(
+            "MENSAJE RECIBIDO: user_id=%s username=%s texto=%r",
+            user.id if user else None,
+            user.username if user else None,
+            message.text,
+        )
+
+        # ─────────────────────────────────────────
+        # COMPROBAR ADMIN
+        # ─────────────────────────────────────────
+
         if not user or user.id not in config.admin_ids:
             logger.info(
                 "Mensaje ignorado de usuario no autorizado "
@@ -43,6 +57,11 @@ def build_message_handler(config):
                 user.id if user else "desconocido",
             )
             return
+
+        logger.info(
+            "Usuario autorizado: user_id=%s",
+            user.id,
+        )
 
         # ─────────────────────────────────────────
         # SI ESTAMOS ESPERANDO EL NOMBRE
@@ -53,6 +72,7 @@ def build_message_handler(config):
         )
 
         if pending_product:
+
             name = message.text.strip()
 
             if not name:
@@ -240,4 +260,3 @@ def build_message_handler(config):
         )
 
     return handle_message
-
