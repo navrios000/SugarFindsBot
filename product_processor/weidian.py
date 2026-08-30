@@ -1,4 +1,3 @@
-
 """Adaptador de Weidian.
 
 Descarga nombre, precio e imágenes de un producto de Weidian y, cuando
