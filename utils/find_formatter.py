@@ -1,33 +1,45 @@
-"""Convierte un ProductData ya completo en el texto final del FIND.
+"""Formato final de los FINDs de SugarFindsBot."""
 
-Genera un caption en HTML (parse_mode="HTML" de Telegram), pensado
-para usarse como caption del primer elemento de un media group de
-fotos — así "Spreadsheet" y "SugarGoo" salen como texto clicable en
-vez de URLs largas visibles.
-"""
-
-import html as html_lib
+import html
 
 from utils.product_data import ProductData
 
 
-def build_find_caption(product: ProductData) -> str:
-    """Texto del FIND (sin las fotos, que se envían aparte como media
-    group). Orden pedido: Spreadsheet -> nombre -> precio -> SugarGoo
-    -> cupones."""
+SPREADSHEET_LABEL = "SPREADSHEET +3000 LINKS"
+SUGARGOO_LABEL = "SUGARGOO"
+USFANS_LABEL = "USFANS"
+SUGARGOO_COUPON_LABEL = "SUGARGOO COUPON"
+USFANS_COUPON_LABEL = "USFANS COUPON"
 
-    name = html_lib.escape(product.name)
+
+def build_find_caption(product: ProductData) -> str:
+    """Construye el texto final del FIND."""
+
+    name = html.escape(product.name)
 
     lines = [
-        f'📊 <a href="{product.spreadsheet_url}">Spreadsheet</a>',
+        f'<a href="{product.spreadsheet_url}">{SPREADSHEET_LABEL}</a>',
         "",
         f"🏷️ {name}",
         "",
         f"💰 {product.price}",
         "",
-        f'🔗 <a href="{product.sugargoo_url}">SugarGoo</a>',
-        "",
-        f"🎟️ SugarGoo Coupon: {product.sugargoo_coupon}",
-        f"🎟️ USFans Coupon: {product.usfans_coupon}",
+        f'<a href="{product.sugargoo_url}">{SUGARGOO_LABEL}</a>',
     ]
+
+    if product.usfans_url:
+        lines.append(
+            f'<a href="{product.usfans_url}">{USFANS_LABEL}</a>'
+        )
+
+    lines.extend(
+        [
+            "",
+            f'<a href="{product.sugargoo_coupon}">'
+            f'{SUGARGOO_COUPON_LABEL}</a>',
+            f'<a href="{product.usfans_coupon}">'
+            f'{USFANS_COUPON_LABEL}</a>',
+        ]
+    )
+
     return "\n".join(lines)
