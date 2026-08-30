@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     libdrm2 \
     libdbus-1-3 \
     libxkbcommon0 \
-    libxcomposite1 \
+    libxcomposite0 \
     libxdamage1 \
     libxfixes3 \
     libxrandr2 \
@@ -24,11 +24,11 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# Instalar dependencias Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN playwright install chromium
-
+# Copiar aplicación
 COPY bot.py config.py ./
 COPY handlers/ ./handlers/
 COPY utils/ ./utils/
@@ -36,9 +36,17 @@ COPY product_processor/ ./product_processor/
 COPY inspect_sugargoo.py ./
 COPY inspect_weidian.py ./
 
+# Crear usuario no-root
 RUN useradd --create-home --shell /bin/bash appuser
+
+# Dar permisos sobre la aplicación
 RUN chown -R appuser:appuser /app /home/appuser
 
+# Ejecutar todo lo relacionado con Playwright como appuser
 USER appuser
 
+# Instalar Chromium para appuser
+RUN playwright install chromium
+
+# Ejecutar bot
 CMD ["python", "bot.py"]
