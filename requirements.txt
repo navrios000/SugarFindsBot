@@ -1,4 +1,5 @@
 python-telegram-bot==22.5
 aiohttp
-playwright
 python-dotenv
+playwright
+wordninja
