@@ -1,4 +1,4 @@
-```python
+
 """Adaptador de 1688.
 
 Obtiene nombre, precio e imágenes de un producto de 1688
@@ -453,4 +453,4 @@ async def fetch(
         raise ProductFetchError(
             f"Error al obtener el producto de 1688: {e}"
         ) from e
-```
+
