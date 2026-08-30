@@ -18,26 +18,26 @@ def build_find_caption(product: ProductData) -> str:
     name = html.escape(product.name)
 
     lines = [
-        f'<a href="{product.spreadsheet_url}">{SPREADSHEET_LABEL}</a>',
+        f'📊 <a href="{product.spreadsheet_url}">{SPREADSHEET_LABEL}</a>',
         "",
         f"🏷️ {name}",
         "",
         f"💰 {product.price}",
         "",
-        f'<a href="{product.sugargoo_url}">{SUGARGOO_LABEL}</a>',
+        f'🔗 <a href="{product.sugargoo_url}">{SUGARGOO_LABEL}</a>',
     ]
 
     if product.usfans_url:
         lines.append(
-            f'<a href="{product.usfans_url}">{USFANS_LABEL}</a>'
+            f'🔗 <a href="{product.usfans_url}">{USFANS_LABEL}</a>'
         )
 
     lines.extend(
         [
             "",
-            f'<a href="{product.sugargoo_coupon}">'
+            f'🎟️ <a href="{product.sugargoo_coupon}">'
             f'{SUGARGOO_COUPON_LABEL}</a>',
-            f'<a href="{product.usfans_coupon}">'
+            f'🎟️ <a href="{product.usfans_coupon}">'
             f'{USFANS_COUPON_LABEL}</a>',
         ]
     )
