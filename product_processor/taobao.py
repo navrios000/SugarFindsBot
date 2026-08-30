@@ -15,10 +15,38 @@ from utils.product_data import ProductData
 
 
 _MAX_IMAGES = 9
+_PAGE_TIMEOUT = 30000
 
-_HEADERS = {
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
+_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+
+def _normalise_url(url: str) -> str:
+    """Normaliza la URL de Taobao."""
+
+    url = url.strip()
+
+    if not url:
+        return ""
+
+    parsed = urlparse(url)
+
+    if not parsed.scheme:
+        return "https://" + url
+
+    return url
+
+
+def _clean_text(value: str) -> str:
+    """Limpia texto obtenido de Taobao."""
+
+    if not value:
+        return ""
+
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _clean_price(value: str) -> str:
@@ -43,6 +71,8 @@ def _clean_image_url(url: str) -> str:
     if not url:
         return ""
 
+    url = url.strip()
+
     if url.startswith("//"):
         url = "https:" + url
 
@@ -50,7 +80,7 @@ def _clean_image_url(url: str) -> str:
 
 
 def _is_product_image(url: str) -> bool:
-    """Filtra imágenes que probablemente no sean del producto."""
+    """Comprueba si una URL parece corresponder a una imagen real."""
 
     if not url:
         return False
@@ -68,16 +98,34 @@ def _is_product_image(url: str) -> bool:
         "sprite",
         "loading",
         "qrcode",
+        "seller",
+        "shop",
     )
 
-    return not any(word in lowered for word in junk)
+    if any(word in lowered for word in junk):
+        return False
+
+    # Taobao suele servir imágenes desde estos CDNs.
+    valid_domains = (
+        "alicdn.com",
+        "taobao.com",
+        "tbcdn.cn",
+    )
+
+    if not any(domain in lowered for domain in valid_domains):
+        return False
+
+    return True
 
 
 def _deduplicate_images(images: list[str]) -> list[str]:
-    result = []
-    seen = set()
+    """Elimina imágenes duplicadas y limita la cantidad."""
+
+    result: list[str] = []
+    seen: set[str] = set()
 
     for image in images:
+
         image = _clean_image_url(image)
 
         if not _is_product_image(image):
@@ -97,15 +145,243 @@ def _deduplicate_images(images: list[str]) -> list[str]:
     return result
 
 
-def _normalise_url(url: str) -> str:
-    """Convierte enlaces de Taobao móviles en URLs utilizables."""
+async def _get_meta_content(page, property_name: str) -> str:
+    """Obtiene el contenido de una etiqueta meta."""
 
-    parsed = urlparse(url)
+    try:
+        locator = page.locator(
+            f'meta[property="{property_name}"]'
+        ).first
 
-    if not parsed.scheme:
-        return "https://" + url
+        if await locator.count():
+            value = await locator.get_attribute("content")
 
-    return url
+            if value:
+                return _clean_text(value)
+
+    except Exception:
+        pass
+
+    return ""
+
+
+async def _extract_title(page) -> str:
+    """Extrae el nombre del producto usando varios métodos."""
+
+    # 1. Open Graph
+    title = await _get_meta_content(
+        page,
+        "og:title",
+    )
+
+    if title:
+        return title
+
+    # 2. Meta description/title alternativos
+    for selector in (
+        'meta[name="title"]',
+        'meta[name="description"]',
+    ):
+        try:
+            locator = page.locator(selector).first
+
+            if await locator.count():
+                value = await locator.get_attribute("content")
+
+                if value:
+                    value = _clean_text(value)
+
+                    if value:
+                        return value
+
+        except Exception:
+            continue
+
+    # 3. H1
+    try:
+        h1 = page.locator("h1").first
+
+        if await h1.count():
+            value = await h1.inner_text(timeout=5000)
+            value = _clean_text(value)
+
+            if value:
+                return value
+
+    except Exception:
+        pass
+
+    # 4. Título HTML
+    try:
+        value = _clean_text(await page.title())
+
+        # Evitamos devolver títulos típicos de login/error.
+        lowered = value.lower()
+
+        if value and not any(
+            word in lowered
+            for word in (
+                "login",
+                "sign in",
+                "登录",
+                "error",
+            )
+        ):
+            return value
+
+    except Exception:
+        pass
+
+    return ""
+
+
+async def _extract_price(page) -> str:
+    """Extrae el precio del producto."""
+
+    # Primero intentamos Open Graph.
+    price = await _get_meta_content(
+        page,
+        "product:price:amount",
+    )
+
+    price = _clean_price(price)
+
+    if price:
+        return price
+
+    # Selectores más específicos antes de los genéricos.
+    selectors = [
+        '[class*="Price--"]',
+        '[class*="price--"]',
+        '[class*="Price"]',
+        '[class*="price"]',
+    ]
+
+    for selector in selectors:
+
+        try:
+
+            locator = page.locator(selector)
+
+            count = await locator.count()
+
+            for index in range(min(count, 20)):
+
+                element = locator.nth(index)
+
+                # Primero content.
+                value = await element.get_attribute(
+                    "content"
+                )
+
+                if not value:
+                    try:
+                        value = await element.inner_text(
+                            timeout=1000
+                        )
+                    except Exception:
+                        value = ""
+
+                cleaned = _clean_price(value)
+
+                if cleaned:
+                    return cleaned
+
+        except Exception:
+            continue
+
+    # Último intento: buscar patrones de precio en el HTML.
+    try:
+
+        html = await page.content()
+
+        patterns = [
+            r'"price"\s*:\s*"([\d.]+)"',
+            r'"price"\s*:\s*([\d.]+)',
+            r'"currentPrice"\s*:\s*"([\d.]+)"',
+            r'"currentPrice"\s*:\s*([\d.]+)',
+        ]
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                html,
+                re.IGNORECASE,
+            )
+
+            if match:
+                cleaned = _clean_price(
+                    match.group(1)
+                )
+
+                if cleaned:
+                    return cleaned
+
+    except Exception:
+        pass
+
+    return ""
+
+
+async def _extract_images(page) -> list[str]:
+    """Extrae imágenes del producto."""
+
+    images: list[str] = []
+
+    # Open Graph
+    try:
+
+        meta_images = page.locator(
+            'meta[property="og:image"]'
+        )
+
+        count = await meta_images.count()
+
+        for index in range(count):
+
+            element = meta_images.nth(index)
+
+            url = await element.get_attribute(
+                "content"
+            )
+
+            if url:
+                images.append(url)
+
+    except Exception:
+        pass
+
+    # Imágenes visibles/DOM
+    try:
+
+        image_elements = page.locator("img")
+
+        count = await image_elements.count()
+
+        for index in range(min(count, 100)):
+
+            element = image_elements.nth(index)
+
+            for attribute in (
+                "src",
+                "data-src",
+                "data-lazy-src",
+                "data-original",
+            ):
+
+                url = await element.get_attribute(
+                    attribute
+                )
+
+                if url:
+                    images.append(url)
+                    break
+
+    except Exception:
+        pass
+
+    return _deduplicate_images(images)
 
 
 async def fetch(product_url: str) -> ProductData:
@@ -113,7 +389,13 @@ async def fetch(product_url: str) -> ProductData:
 
     product_url = _normalise_url(product_url)
 
+    if not product_url:
+        raise ProductFetchError(
+            "La URL de Taobao está vacía."
+        )
+
     try:
+
         async with async_playwright() as p:
 
             browser = await p.chromium.launch(
@@ -121,138 +403,118 @@ async def fetch(product_url: str) -> ProductData:
             )
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 "
-                    "(KHTML, like Gecko) Version/17.0 "
-                    "Mobile/15E148 Safari/604.1"
-                ),
+                user_agent=_USER_AGENT,
                 locale="zh-CN",
-                extra_http_headers=_HEADERS,
+                viewport={
+                    "width": 390,
+                    "height": 844,
+                },
+                is_mobile=True,
+                device_scale_factor=3,
             )
 
             page = await context.new_page()
 
+            # Bloqueamos recursos que no necesitamos.
+            async def handle_route(route):
+
+                resource_type = route.request.resource_type
+
+                if resource_type in {
+                    "font",
+                    "media",
+                    "websocket",
+                }:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route(
+                "**/*",
+                handle_route,
+            )
+
             try:
+
                 await page.goto(
                     product_url,
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=_PAGE_TIMEOUT,
                 )
 
-                await page.wait_for_timeout(3000)
+                # Dejamos tiempo para que Taobao renderice
+                # el contenido dinámico.
+                await page.wait_for_timeout(5000)
 
-                title = ""
+                current_url = page.url.lower()
 
-                # Open Graph.
-                title = await page.locator(
-                    'meta[property="og:title"]'
-                ).get_attribute("content") or ""
+                # -------------------------------------------------
+                # DETECTAR LOGIN / BLOQUEO
+                # -------------------------------------------------
 
-                # Título HTML.
-                if not title:
-                    title = await page.title()
+                if (
+                    "login.taobao.com" in current_url
+                    or "login.tmall.com" in current_url
+                ):
+                    raise ProductFetchError(
+                        "Taobao redirigió a login. "
+                        "El producto está bloqueado para acceso "
+                        "sin sesión."
+                    )
 
-                # H1.
-                if not title:
-                    try:
-                        title = await page.locator(
-                            "h1"
-                        ).first.inner_text(
+                # -------------------------------------------------
+                # DETECTAR CAPTCHA / ANTI-BOT
+                # -------------------------------------------------
+
+                page_text = ""
+
+                try:
+                    page_text = (
+                        await page.locator("body").inner_text(
                             timeout=5000
                         )
-                    except Exception:
-                        pass
+                    ).lower()
+                except Exception:
+                    pass
 
-                title = title.strip()
+                blocked_words = (
+                    "captcha",
+                    "verify",
+                    "验证",
+                    "安全验证",
+                    "robot",
+                    "人机",
+                )
 
-                # Precio.
-                price = ""
+                if any(
+                    word in page_text
+                    for word in blocked_words
+                ):
+                    raise ProductFetchError(
+                        "Taobao mostró una pantalla de "
+                        "verificación/anti-bot."
+                    )
 
-                price_selectors = [
-                    'meta[property="product:price:amount"]',
-                    '[class*="price"]',
-                    '[class*="Price"]',
-                ]
+                # -------------------------------------------------
+                # EXTRAER DATOS
+                # -------------------------------------------------
 
-                for selector in price_selectors:
-                    try:
+                title = await _extract_title(page)
 
-                        locator = page.locator(selector)
+                price = await _extract_price(page)
 
-                        count = await locator.count()
-
-                        for i in range(min(count, 10)):
-
-                            element = locator.nth(i)
-
-                            value = (
-                                await element.get_attribute(
-                                    "content"
-                                )
-                            )
-
-                            if not value:
-                                try:
-                                    value = await element.inner_text(
-                                        timeout=1000
-                                    )
-                                except Exception:
-                                    value = ""
-
-                            cleaned = _clean_price(value)
-
-                            if cleaned:
-                                price = cleaned
-                                break
-
-                        if price:
-                            break
-
-                    except Exception:
-                        continue
-
-                # Imágenes.
-                images = []
-
-                meta_images = await page.locator(
-                    'meta[property="og:image"]'
-                ).all()
-
-                for element in meta_images:
-                    url = await element.get_attribute("content")
-
-                    if url:
-                        images.append(url)
-
-                image_elements = await page.locator(
-                    "img"
-                ).all()
-
-                for element in image_elements:
-
-                    url = await element.get_attribute("src")
-
-                    if not url:
-                        url = await element.get_attribute(
-                            "data-src"
-                        )
-
-                    if url:
-                        images.append(url)
-
-                images = _deduplicate_images(images)
+                images = await _extract_images(page)
 
                 if not title:
                     raise ProductFetchError(
-                        "No se pudo obtener el nombre del producto "
-                        "de Taobao."
+                        "Taobao no permitió obtener el nombre "
+                        "del producto."
                     )
 
                 if not price:
                     raise ProductFetchError(
-                        "No se pudo obtener el precio del producto "
-                        "de Taobao."
+                        "Taobao no permitió obtener el precio "
+                        "del producto."
                     )
 
                 return ProductData(
@@ -264,6 +526,7 @@ async def fetch(product_url: str) -> ProductData:
                 )
 
             finally:
+
                 await context.close()
                 await browser.close()
 
