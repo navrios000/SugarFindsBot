@@ -1,4 +1,4 @@
-```python
+
 """Detector de marcas a partir de nombres e imágenes de productos."""
 
 import base64
@@ -223,4 +223,4 @@ def _extract_response_text(result: dict) -> str:
                 return content.get("text", "")
 
     return ""
-```
+
