@@ -1,4 +1,3 @@
-
 """Handler de mensajes: detecta enlaces, genera el FIND y lo publica."""
 
 import logging
@@ -8,12 +7,14 @@ from telegram.ext import ContextTypes
 
 from product_processor.base import ProductFetchError
 from product_processor.dispatcher import UnsupportedPlatformError, process
+
 from utils.affiliate import (
     build_sugargoo_url,
     build_usfans_product_url,
 )
+
 from utils.find_formatter import build_find_caption
-from utils.link_parser import Platform, find_product_link
+from utils.link_parser import find_product_link
 from utils.pricing import cny_to_eur
 
 
@@ -90,23 +91,13 @@ def build_message_handler(config):
                 None,
             )
 
-            # ─────────────────────────────────────
-            # DIAGNÓSTICO DEL PRODUCTO
-            # ─────────────────────────────────────
-
-            logger.info(
-                "PUBLICANDO FIND: user_id=%s | "
-                "usfans_url=%r | sugargoo_url=%r | "
-                "spreadsheet_url=%r | images=%d",
-                user.id if user else None,
-                pending_product.usfans_url,
-                pending_product.sugargoo_url,
-                pending_product.spreadsheet_url,
-                len(pending_product.images or []),
-            )
-
             caption = build_find_caption(
                 pending_product
+            )
+
+            logger.info(
+                "Publicando FIND para user_id=%s",
+                user.id,
             )
 
             try:
@@ -142,13 +133,17 @@ def build_message_handler(config):
                 )
 
                 logger.info(
-                    "FIND publicado correctamente."
+                    "FIND publicado correctamente "
+                    "para user_id=%s",
+                    user.id,
                 )
 
             except Exception:
 
                 logger.exception(
-                    "Error al publicar el FIND en el canal"
+                    "Error al publicar el FIND en el canal "
+                    "para user_id=%s",
+                    user.id,
                 )
 
                 await message.reply_text(
@@ -177,18 +172,19 @@ def build_message_handler(config):
             product_url,
         )
 
-        if platform != Platform.WEIDIAN:
-            await message.reply_text(
-                f"Detecté un link de "
-                f"{platform.value.capitalize()}, pero esa "
-                "plataforma todavía no se procesa "
-                "automáticamente."
-            )
-            return
-
         # ─────────────────────────────────────────
-        # OBTENER PRODUCTO
+        # PROCESAR PRODUCTO
         # ─────────────────────────────────────────
+        #
+        # IMPORTANTE:
+        # No bloqueamos ninguna plataforma aquí.
+        #
+        # El dispatcher decide qué adaptador utilizar:
+        #
+        # Weidian  -> weidian.py
+        # Taobao   -> taobao.py
+        # 1688     -> platform_1688.py
+        #
 
         try:
 
@@ -199,31 +195,72 @@ def build_message_handler(config):
 
         except UnsupportedPlatformError as e:
 
+            logger.warning(
+                "Plataforma no soportada: %s",
+                platform.value,
+            )
+
             await message.reply_text(
                 str(e)
             )
+
             return
 
         except ProductFetchError as e:
 
             logger.exception(
-                "Fallo al procesar %s",
-                product_url,
+                "Fallo al procesar producto de %s: %s",
+                platform.value,
+                e,
             )
 
             await message.reply_text(
-                f"No pude obtener los datos del producto: {e}"
+                f"❌ No pude obtener los datos del producto:\n\n"
+                f"{e}"
             )
+
+            return
+
+        except Exception as e:
+
+            logger.exception(
+                "Error inesperado procesando producto "
+                "de %s: %s",
+                platform.value,
+                e,
+            )
+
+            await message.reply_text(
+                "❌ Ocurrió un error inesperado "
+                "al procesar el producto."
+            )
+
             return
 
         # ─────────────────────────────────────────
         # PRECIO
         # ─────────────────────────────────────────
 
-        product.price = cny_to_eur(
-            product.price,
-            config.cny_eur_rate,
-        )
+        try:
+
+            product.price = cny_to_eur(
+                product.price,
+                config.cny_eur_rate,
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Error convirtiendo el precio: %s",
+                e,
+            )
+
+            await message.reply_text(
+                "❌ No pude convertir el precio "
+                "del producto."
+            )
+
+            return
 
         # ─────────────────────────────────────────
         # ENLACES
@@ -252,18 +289,26 @@ def build_message_handler(config):
         )
 
         logger.info(
-            "ENLACES GENERADOS: user_id=%s | "
-            "usfans_url=%r | sugargoo_url=%r",
-            user.id,
-            product.usfans_url,
-            product.sugargoo_url,
+            "Enlaces generados para %s | "
+            "Sugargoo=%s | USFans=%s",
+            platform.value,
+            bool(product.sugargoo_url),
+            bool(product.usfans_url),
         )
+
+        if not product.sugargoo_url:
+
+            logger.warning(
+                "No se pudo generar el enlace "
+                "de SugarGoo para %s",
+                product_url,
+            )
 
         if not product.usfans_url:
 
             logger.warning(
-                "No se pudo generar el enlace de "
-                "producto de USFans para %s",
+                "No se pudo generar el enlace "
+                "de USFans para %s",
                 product_url,
             )
 
@@ -275,6 +320,15 @@ def build_message_handler(config):
             "pending_product"
         ] = product
 
+        logger.info(
+            "Producto procesado correctamente: "
+            "platform=%s name=%r price=%r images=%d",
+            platform.value,
+            product.name,
+            product.price,
+            len(product.images),
+        )
+
         await message.reply_text(
             "🏷️ ¿Qué nombre quieres ponerle al FIND?\n\n"
             "Escribe exactamente el nombre que quieres "
@@ -284,4 +338,3 @@ def build_message_handler(config):
         )
 
     return handle_message
-
