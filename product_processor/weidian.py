@@ -1,596 +1,298 @@
-
 """Adaptador de Weidian.
 
-Obtiene nombre, precio e imágenes de un producto de Weidian
-mediante Playwright.
+Descarga nombre, precio e imágenes de un producto de Weidian y, cuando
+es posible, detecta la marca automáticamente a partir del nombre o
+de las imágenes del producto.
 """
 
+import html as html_lib
 import re
-from urllib.parse import urlparse
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
+import aiohttp
 
 from product_processor.base import ProductFetchError
+from utils.brand_detector import detect_brand_from_image, detect_brand_from_name
 from utils.product_data import ProductData
 
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# --- Nombre ---
+_ITEM_NAME_ESCAPED_RE = re.compile(
+    r"item_name&#34;\s*:\s*&#34;(.*?)&#34;"
+)
+_ITEM_NAME_NORMAL_RE = re.compile(
+    r'"item_name"\s*:\s*"(.*?)"'
+)
+
+# --- Precio ---
+_ITEM_LOW_PRICE_ESCAPED_RE = re.compile(
+    r"itemLowPrice&#34;\s*:\s*(\d+)"
+)
+_ITEM_LOW_PRICE_NORMAL_RE = re.compile(
+    r'"itemLowPrice"\s*:\s*(\d+)'
+)
+
+_PRICE_FIELD_ESCAPED_RE = re.compile(
+    r"(?<!Low)price&#34;\s*:\s*&#34;([\d.]+)&#34;",
+    re.IGNORECASE,
+)
+_PRICE_FIELD_NORMAL_RE = re.compile(
+    r'(?<!Low)"price"\s*:\s*"([\d.]+)"',
+    re.IGNORECASE,
+)
+
+_ORIGIN_PRICE_ESCAPED_RE = re.compile(
+    r"origin_price&#34;\s*:\s*&#34;([\d.]+)&#34;"
+)
+_ORIGIN_PRICE_NORMAL_RE = re.compile(
+    r'"origin_price"\s*:\s*"([\d.]+)"'
+)
+
+# --- Imágenes ---
+_IMG_URL_RE = re.compile(
+    r'https://[a-zA-Z0-9.\-]*geilicdn\.com/[^\s"\'&)]+'
+    r'\.(?:jpg|jpeg|png|webp)',
+    re.IGNORECASE,
+)
+
+_DIMENSION_SUFFIX_RE = re.compile(
+    r"_(\d+)_(\d+)\.(?:jpg|jpeg|png|webp)$",
+    re.IGNORECASE,
+)
+
+_JUNK_KEYWORDS = (
+    "unadjust",
+    "hz_img",
+    "default",
+    "headimg",
+    "logo",
+)
+
+_MIN_IMAGE_DIMENSION = 200
 
 _MAX_IMAGES = 9
 
-_PAGE_TIMEOUT = 30000
 
-_USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Mobile/15E148 Safari/604.1"
-)
+async def fetch(product_url: str) -> ProductData:
+    """Descarga y procesa la página pública de un producto de Weidian."""
+
+    try:
+        async with aiohttp.ClientSession(
+            headers=_HEADERS,
+            timeout=_TIMEOUT,
+        ) as session:
+            async with session.get(product_url) as resp:
+                if resp.status != 200:
+                    raise ProductFetchError(
+                        f"Weidian devolvió status {resp.status} para {product_url}"
+                    )
+
+                page_html = await resp.text()
+
+    except aiohttp.ClientError as e:
+        raise ProductFetchError(
+            f"Error de red al pedir {product_url}: {e}"
+        ) from e
+
+    # Comprobamos si Weidian ha redirigido a login/registro.
+    head = page_html[:3000].lower()
+
+    if (
+        "login.taobao" in head
+        or "/register" in head
+        or "<title>register</title>" in head
+    ):
+        raise ProductFetchError(
+            "Weidian redirigió a login/register para este producto: "
+            "la vista pública no está disponible."
+        )
+
+    # Extraemos los datos básicos.
+    raw_name = _extract_name(page_html)
+    price = _extract_price(page_html)
+    images = _extract_images(page_html)
+
+    if not raw_name or not price:
+        raise ProductFetchError(
+            "No se pudo extraer nombre y/o precio del HTML de Weidian "
+            "(puede que hayan cambiado la estructura de la página; "
+            "usa inspect_weidian.py para revisar el HTML actual)."
+        )
+
+    # ---------------------------------------------------------
+    # DETECCIÓN DE MARCA
+    # ---------------------------------------------------------
+    #
+    # Primero intentamos obtener la marca directamente del nombre.
+    # Esto no consume API y es instantáneo.
+    #
+    brand = detect_brand_from_name(raw_name)
+
+    # Si el nombre no contiene una marca reconocible, utilizamos
+    # la primera imagen real del producto.
+    #
+    # Esto permite detectar casos como:
+    #
+    #   "WeightcottonT-shirtbottominglongsleeve..."
+    #
+    # cuando en la camiseta aparece claramente el logo de
+    # Maison Margiela, Nike, Stone Island, etc.
+    if not brand and images:
+        brand = await detect_brand_from_image(images[0])
+
+    # Construimos el nombre final.
+    #
+    # El nombre original seguirá estando disponible como descripción.
+    # Si encontramos una marca, la colocamos al principio.
+    final_name = _build_name_with_brand(raw_name, brand)
+
+    return ProductData(
+        source_url=product_url,
+        platform="weidian",
+        name=final_name,
+        price=f"¥{price}",
+        images=images,
+    )
 
 
-def _normalise_url(url: str) -> str:
-    """Normaliza la URL de Weidian."""
+def _extract_name(page_html: str) -> str:
+    """Extrae item_name del JSON embebido."""
 
-    url = url.strip()
-
-    if not url:
-        return ""
-
-    parsed = urlparse(url)
-
-    if not parsed.scheme:
-        return "https://" + url
-
-    return url
-
-
-def _clean_text(value: str) -> str:
-    """Limpia texto obtenido de Weidian."""
-
-    if not value:
-        return ""
-
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def _clean_price(value: str) -> str:
-    """Extrae un precio numérico del texto."""
-
-    if not value:
-        return ""
-
-    value = value.replace(",", ".")
-
-    match = re.search(r"\d+(?:\.\d+)?", value)
+    match = (
+        _ITEM_NAME_ESCAPED_RE.search(page_html)
+        or _ITEM_NAME_NORMAL_RE.search(page_html)
+    )
 
     if not match:
         return ""
 
-    return match.group(0)
+    return html_lib.unescape(match.group(1)).strip()
 
 
-def _clean_image_url(url: str) -> str:
-    """Normaliza una URL de imagen."""
+def _format_amount(amount: float) -> str:
+    """Formatea un precio en yuanes sin decimales innecesarios."""
 
-    if not url:
-        return ""
+    if amount == int(amount):
+        return str(int(amount))
 
-    url = url.strip()
-
-    if url.startswith("//"):
-        url = "https:" + url
-
-    return url.split("?")[0]
+    return f"{amount:.2f}"
 
 
-def _is_product_image(url: str) -> bool:
-    """Comprueba si una URL parece corresponder a una imagen real."""
+def _extract_price(page_html: str) -> str:
+    """Extrae el precio usando itemLowPrice -> price -> origin_price."""
 
-    if not url:
-        return False
-
-    lowered = url.lower()
-
-    if not lowered.startswith(("http://", "https://")):
-        return False
-
-    junk = (
-        "logo",
-        "avatar",
-        "icon",
-        "favicon",
-        "sprite",
-        "loading",
-        "qrcode",
-        "seller",
-        "shop",
+    # 1. itemLowPrice: céntimos de yuan.
+    match = (
+        _ITEM_LOW_PRICE_ESCAPED_RE.search(page_html)
+        or _ITEM_LOW_PRICE_NORMAL_RE.search(page_html)
     )
 
-    if any(word in lowered for word in junk):
-        return False
+    if match:
+        cents = int(match.group(1))
+        return _format_amount(cents / 100)
 
-    return True
+    # 2. price: yuanes.
+    match = (
+        _PRICE_FIELD_ESCAPED_RE.search(page_html)
+        or _PRICE_FIELD_NORMAL_RE.search(page_html)
+    )
 
+    if match:
+        return _format_amount(float(match.group(1)))
 
-def _deduplicate_images(images: list[str]) -> list[str]:
-    """Elimina imágenes duplicadas y limita la cantidad."""
+    # 3. origin_price: yuanes.
+    match = (
+        _ORIGIN_PRICE_ESCAPED_RE.search(page_html)
+        or _ORIGIN_PRICE_NORMAL_RE.search(page_html)
+    )
 
-    result: list[str] = []
-    seen: set[str] = set()
-
-    for image in images:
-
-        image = _clean_image_url(image)
-
-        if not _is_product_image(image):
-            continue
-
-        key = image.lower()
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(image)
-
-        if len(result) >= _MAX_IMAGES:
-            break
-
-    return result
-
-
-async def _get_meta_content(page, property_name: str) -> str:
-    """Obtiene el contenido de una etiqueta meta."""
-
-    try:
-
-        locator = page.locator(
-            f'meta[property="{property_name}"]'
-        ).first
-
-        if await locator.count():
-
-            value = await locator.get_attribute(
-                "content"
-            )
-
-            if value:
-                return _clean_text(value)
-
-    except Exception:
-        pass
+    if match:
+        return _format_amount(float(match.group(1)))
 
     return ""
 
 
-async def _extract_title(page) -> str:
-    """Extrae el nombre del producto."""
-
-    # 1. Open Graph
-    title = await _get_meta_content(
-        page,
-        "og:title",
-    )
-
-    if title:
-        return title
-
-    # 2. Meta title / description
-    for selector in (
-        'meta[name="title"]',
-        'meta[name="description"]',
-    ):
-
-        try:
-
-            locator = page.locator(selector).first
-
-            if await locator.count():
-
-                value = await locator.get_attribute(
-                    "content"
-                )
-
-                if value:
-
-                    value = _clean_text(value)
-
-                    if value:
-                        return value
-
-        except Exception:
-            continue
-
-    # 3. H1
-    try:
-
-        h1 = page.locator("h1").first
-
-        if await h1.count():
-
-            value = await h1.inner_text(
-                timeout=5000
-            )
-
-            value = _clean_text(value)
-
-            if value:
-                return value
-
-    except Exception:
-        pass
-
-    # 4. Título HTML
-    try:
-
-        value = _clean_text(
-            await page.title()
-        )
-
-        lowered = value.lower()
-
-        if value and not any(
-            word in lowered
-            for word in (
-                "login",
-                "sign in",
-                "error",
-            )
-        ):
-            return value
-
-    except Exception:
-        pass
-
-    return ""
-
-
-async def _extract_price(page) -> str:
-    """Extrae el precio del producto."""
-
-    # Open Graph
-    price = await _get_meta_content(
-        page,
-        "product:price:amount",
-    )
-
-    price = _clean_price(price)
-
-    if price:
-        return price
-
-    # Selectores de precio
-    selectors = [
-        '[class*="Price--"]',
-        '[class*="price--"]',
-        '[class*="Price"]',
-        '[class*="price"]',
-    ]
-
-    for selector in selectors:
-
-        try:
-
-            locator = page.locator(selector)
-
-            count = await locator.count()
-
-            for index in range(min(count, 20)):
-
-                element = locator.nth(index)
-
-                value = await element.get_attribute(
-                    "content"
-                )
-
-                if not value:
-
-                    try:
-
-                        value = await element.inner_text(
-                            timeout=1000
-                        )
-
-                    except Exception:
-
-                        value = ""
-
-                cleaned = _clean_price(value)
-
-                if cleaned:
-                    return cleaned
-
-        except Exception:
-            continue
-
-    # Buscar patrones en el HTML
-    try:
-
-        html = await page.content()
-
-        patterns = [
-            r'"price"\s*:\s*"([\d.]+)"',
-            r'"price"\s*:\s*([\d.]+)',
-            r'"currentPrice"\s*:\s*"([\d.]+)"',
-            r'"currentPrice"\s*:\s*([\d.]+)',
-        ]
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                html,
-                re.IGNORECASE,
-            )
-
-            if match:
-
-                cleaned = _clean_price(
-                    match.group(1)
-                )
-
-                if cleaned:
-                    return cleaned
-
-    except Exception:
-        pass
-
-    return ""
-
-
-async def _extract_images(page) -> list[str]:
-    """Extrae imágenes del producto."""
+def _extract_images(page_html: str) -> list[str]:
+    """Extrae únicamente imágenes reales de producto."""
 
     images: list[str] = []
+    seen_keys: set[str] = set()
 
-    # Open Graph
-    try:
+    for match in _IMG_URL_RE.finditer(page_html):
+        url = match.group(0).split("?")[0]
+        url_lower = url.lower()
 
-        meta_images = page.locator(
-            'meta[property="og:image"]'
+        # Descarta logos, avatares, iconos y banners.
+        if any(keyword in url_lower for keyword in _JUNK_KEYWORDS):
+            continue
+
+        # Descarta imágenes demasiado pequeñas.
+        dim_match = _DIMENSION_SUFFIX_RE.search(url)
+
+        if dim_match:
+            width = int(dim_match.group(1))
+            height = int(dim_match.group(2))
+
+            if (
+                width < _MIN_IMAGE_DIMENSION
+                or height < _MIN_IMAGE_DIMENSION
+            ):
+                continue
+
+        # Evita duplicados.
+        dedup_key = (
+            url_lower[: -len(".webp")]
+            if url_lower.endswith(".webp")
+            else url_lower
         )
 
-        count = await meta_images.count()
+        if dedup_key in seen_keys:
+            continue
 
-        for index in range(count):
+        seen_keys.add(dedup_key)
+        images.append(url)
 
-            element = meta_images.nth(index)
-
-            url = await element.get_attribute(
-                "content"
-            )
-
-            if url:
-                images.append(url)
-
-    except Exception:
-        pass
-
-    # Imágenes del DOM
-    try:
-
-        image_elements = page.locator("img")
-
-        count = await image_elements.count()
-
-        for index in range(min(count, 100)):
-
-            element = image_elements.nth(index)
-
-            for attribute in (
-                "src",
-                "data-src",
-                "data-lazy-src",
-                "data-original",
-            ):
-
-                url = await element.get_attribute(
-                    attribute
-                )
-
-                if url:
-
-                    images.append(url)
-                    break
-
-    except Exception:
-        pass
-
-    images = _deduplicate_images(images)
-
-    # -------------------------------------------------
-    # WEIDIAN
-    # -------------------------------------------------
-    #
-    # Eliminamos únicamente la primera imagen.
-    #
-    # Si solo existe una imagen, la conservamos para
-    # garantizar que siempre se publique al menos una.
-    #
-
-    if len(images) > 1:
-        images = images[1:]
+        if len(images) >= _MAX_IMAGES:
+            break
 
     return images
 
 
-async def fetch(product_url: str) -> ProductData:
-    """Obtiene los datos de un producto de Weidian."""
+def _build_name_with_brand(raw_name: str, brand: str) -> str:
+    """
+    Construye el nombre que recibirá el resto del bot.
 
-    product_url = _normalise_url(product_url)
+    Ejemplos:
 
-    if not product_url:
-        raise ProductFetchError(
-            "La URL de Weidian está vacía."
-        )
+        raw_name:
+        WeightcottonT-shirtbottominglongsleeve300RR88C
 
-    try:
+        brand:
+        MAISON MARGIELA
 
-        async with async_playwright() as p:
+        resultado:
+        MAISON MARGIELA WeightcottonT-shirtbottominglongsleeve300RR88C
 
-            browser = await p.chromium.launch(
-                headless=True,
-            )
+    Si no se detecta ninguna marca, devuelve el nombre original.
+    """
 
-            context = await browser.new_context(
-                user_agent=_USER_AGENT,
-                locale="zh-CN",
-                viewport={
-                    "width": 390,
-                    "height": 844,
-                },
-                is_mobile=True,
-                device_scale_factor=3,
-            )
+    raw_name = html_lib.unescape(raw_name).strip()
+    brand = brand.strip()
 
-            page = await context.new_page()
+    if not brand:
+        return raw_name
 
-            # Bloqueamos recursos innecesarios.
-            async def handle_route(route):
+    # Evitamos repetir la marca si ya estaba en el nombre.
+    if detect_brand_from_name(raw_name):
+        return raw_name
 
-                resource_type = (
-                    route.request.resource_type
-                )
-
-                if resource_type in {
-                    "font",
-                    "media",
-                    "websocket",
-                }:
-
-                    await route.abort()
-
-                else:
-
-                    await route.continue_()
-
-            await page.route(
-                "**/*",
-                handle_route,
-            )
-
-            try:
-
-                await page.goto(
-                    product_url,
-                    wait_until="domcontentloaded",
-                    timeout=_PAGE_TIMEOUT,
-                )
-
-                # Esperamos a que cargue el contenido dinámico.
-                await page.wait_for_timeout(3000)
-
-                current_url = page.url.lower()
-
-                # -------------------------------------------------
-                # DETECTAR LOGIN
-                # -------------------------------------------------
-
-                if (
-                    "login" in current_url
-                    or "passport" in current_url
-                ):
-
-                    raise ProductFetchError(
-                        "Weidian redirigió a una página "
-                        "de login."
-                    )
-
-                # -------------------------------------------------
-                # DETECTAR BLOQUEO / VERIFICACIÓN
-                # -------------------------------------------------
-
-                page_text = ""
-
-                try:
-
-                    page_text = (
-                        await page.locator(
-                            "body"
-                        ).inner_text(
-                            timeout=5000
-                        )
-                    ).lower()
-
-                except Exception:
-                    pass
-
-                blocked_words = (
-                    "captcha",
-                    "verify",
-                    "验证",
-                    "安全验证",
-                    "robot",
-                    "人机",
-                )
-
-                if any(
-                    word in page_text
-                    for word in blocked_words
-                ):
-
-                    raise ProductFetchError(
-                        "Weidian mostró una pantalla "
-                        "de verificación/anti-bot."
-                    )
-
-                # -------------------------------------------------
-                # EXTRAER DATOS
-                # -------------------------------------------------
-
-                title = await _extract_title(
-                    page
-                )
-
-                price = await _extract_price(
-                    page
-                )
-
-                images = await _extract_images(
-                    page
-                )
-
-                # -------------------------------------------------
-                # VALIDACIÓN
-                # -------------------------------------------------
-
-                if not title:
-
-                    raise ProductFetchError(
-                        "Weidian no permitió obtener "
-                        "el nombre del producto."
-                    )
-
-                if not price:
-
-                    raise ProductFetchError(
-                        "Weidian no permitió obtener "
-                        "el precio del producto."
-                    )
-
-                return ProductData(
-                    source_url=product_url,
-                    platform="weidian",
-                    name=title,
-                    price=f"¥{price}",
-                    images=images,
-                )
-
-            finally:
-
-                await context.close()
-                await browser.close()
-
-    except PlaywrightTimeoutError as e:
-
-        raise ProductFetchError(
-            "Weidian tardó demasiado en responder."
-        ) from e
-
-    except ProductFetchError:
-        raise
-
-    except Exception as e:
-
-        raise ProductFetchError(
-            f"Error al obtener el producto de Weidian: {e}"
-        ) from e
-
+    return f"{brand} {raw_name}"
