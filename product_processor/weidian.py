@@ -1,8 +1,6 @@
 """Adaptador de Weidian.
 
-Descarga nombre, precio e imágenes de un producto de Weidian y, cuando
-es posible, detecta la marca automáticamente a partir del nombre o
-de las imágenes del producto.
+Obtiene nombre, precio e imágenes de un producto de Weidian.
 """
 
 import html as html_lib
@@ -11,8 +9,8 @@ import re
 import aiohttp
 
 from product_processor.base import ProductFetchError
-from utils.brand_detector import detect_brand_from_image, detect_brand_from_name
 from utils.product_data import ProductData
+
 
 _HEADERS = {
     "User-Agent": (
@@ -25,18 +23,18 @@ _HEADERS = {
 
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
-# --- Nombre ---
 _ITEM_NAME_ESCAPED_RE = re.compile(
     r"item_name&#34;\s*:\s*&#34;(.*?)&#34;"
 )
+
 _ITEM_NAME_NORMAL_RE = re.compile(
     r'"item_name"\s*:\s*"(.*?)"'
 )
 
-# --- Precio ---
 _ITEM_LOW_PRICE_ESCAPED_RE = re.compile(
     r"itemLowPrice&#34;\s*:\s*(\d+)"
 )
+
 _ITEM_LOW_PRICE_NORMAL_RE = re.compile(
     r'"itemLowPrice"\s*:\s*(\d+)'
 )
@@ -45,6 +43,7 @@ _PRICE_FIELD_ESCAPED_RE = re.compile(
     r"(?<!Low)price&#34;\s*:\s*&#34;([\d.]+)&#34;",
     re.IGNORECASE,
 )
+
 _PRICE_FIELD_NORMAL_RE = re.compile(
     r'(?<!Low)"price"\s*:\s*"([\d.]+)"',
     re.IGNORECASE,
@@ -53,11 +52,11 @@ _PRICE_FIELD_NORMAL_RE = re.compile(
 _ORIGIN_PRICE_ESCAPED_RE = re.compile(
     r"origin_price&#34;\s*:\s*&#34;([\d.]+)&#34;"
 )
+
 _ORIGIN_PRICE_NORMAL_RE = re.compile(
     r'"origin_price"\s*:\s*"([\d.]+)"'
 )
 
-# --- Imágenes ---
 _IMG_URL_RE = re.compile(
     r'https://[a-zA-Z0-9.\-]*geilicdn\.com/[^\s"\'&)]+'
     r'\.(?:jpg|jpeg|png|webp)',
@@ -78,7 +77,6 @@ _JUNK_KEYWORDS = (
 )
 
 _MIN_IMAGE_DIMENSION = 200
-
 _MAX_IMAGES = 9
 
 
@@ -90,20 +88,23 @@ async def fetch(product_url: str) -> ProductData:
             headers=_HEADERS,
             timeout=_TIMEOUT,
         ) as session:
+
             async with session.get(product_url) as resp:
+
                 if resp.status != 200:
                     raise ProductFetchError(
-                        f"Weidian devolvió status {resp.status} para {product_url}"
+                        f"Weidian devolvió status {resp.status}."
                     )
 
                 page_html = await resp.text()
 
     except aiohttp.ClientError as e:
+
         raise ProductFetchError(
-            f"Error de red al pedir {product_url}: {e}"
+            f"Error de red al pedir el producto de Weidian: {e}"
         ) from e
 
-    # Comprobamos si Weidian ha redirigido a login/registro.
+    # Detectar si Weidian redirigió a login/register.
     head = page_html[:3000].lower()
 
     if (
@@ -112,60 +113,36 @@ async def fetch(product_url: str) -> ProductData:
         or "<title>register</title>" in head
     ):
         raise ProductFetchError(
-            "Weidian redirigió a login/register para este producto: "
-            "la vista pública no está disponible."
+            "Weidian redirigió a login/register. "
+            "El producto no está disponible públicamente."
         )
 
-    # Extraemos los datos básicos.
-    raw_name = _extract_name(page_html)
+    # Extraer datos.
+    name = _extract_name(page_html)
     price = _extract_price(page_html)
     images = _extract_images(page_html)
 
-    if not raw_name or not price:
+    if not name:
         raise ProductFetchError(
-            "No se pudo extraer nombre y/o precio del HTML de Weidian "
-            "(puede que hayan cambiado la estructura de la página; "
-            "usa inspect_weidian.py para revisar el HTML actual)."
+            "No se pudo obtener el nombre del producto de Weidian."
         )
 
-    # ---------------------------------------------------------
-    # DETECCIÓN DE MARCA
-    # ---------------------------------------------------------
-    #
-    # Primero intentamos obtener la marca directamente del nombre.
-    # Esto no consume API y es instantáneo.
-    #
-    brand = detect_brand_from_name(raw_name)
-
-    # Si el nombre no contiene una marca reconocible, utilizamos
-    # la primera imagen real del producto.
-    #
-    # Esto permite detectar casos como:
-    #
-    #   "WeightcottonT-shirtbottominglongsleeve..."
-    #
-    # cuando en la camiseta aparece claramente el logo de
-    # Maison Margiela, Nike, Stone Island, etc.
-    if not brand and images:
-        brand = await detect_brand_from_image(images[0])
-
-    # Construimos el nombre final.
-    #
-    # El nombre original seguirá estando disponible como descripción.
-    # Si encontramos una marca, la colocamos al principio.
-    final_name = _build_name_with_brand(raw_name, brand)
+    if not price:
+        raise ProductFetchError(
+            "No se pudo obtener el precio del producto de Weidian."
+        )
 
     return ProductData(
         source_url=product_url,
         platform="weidian",
-        name=final_name,
+        name=name,
         price=f"¥{price}",
         images=images,
     )
 
 
 def _extract_name(page_html: str) -> str:
-    """Extrae item_name del JSON embebido."""
+    """Extrae el nombre del producto."""
 
     match = (
         _ITEM_NAME_ESCAPED_RE.search(page_html)
@@ -175,11 +152,13 @@ def _extract_name(page_html: str) -> str:
     if not match:
         return ""
 
-    return html_lib.unescape(match.group(1)).strip()
+    return html_lib.unescape(
+        match.group(1)
+    ).strip()
 
 
 def _format_amount(amount: float) -> str:
-    """Formatea un precio en yuanes sin decimales innecesarios."""
+    """Formatea un precio en yuanes."""
 
     if amount == int(amount):
         return str(int(amount))
@@ -188,9 +167,9 @@ def _format_amount(amount: float) -> str:
 
 
 def _extract_price(page_html: str) -> str:
-    """Extrae el precio usando itemLowPrice -> price -> origin_price."""
+    """Extrae el precio."""
 
-    # 1. itemLowPrice: céntimos de yuan.
+    # 1. itemLowPrice: céntimos.
     match = (
         _ITEM_LOW_PRICE_ESCAPED_RE.search(page_html)
         or _ITEM_LOW_PRICE_NORMAL_RE.search(page_html)
@@ -200,45 +179,53 @@ def _extract_price(page_html: str) -> str:
         cents = int(match.group(1))
         return _format_amount(cents / 100)
 
-    # 2. price: yuanes.
+    # 2. price.
     match = (
         _PRICE_FIELD_ESCAPED_RE.search(page_html)
         or _PRICE_FIELD_NORMAL_RE.search(page_html)
     )
 
     if match:
-        return _format_amount(float(match.group(1)))
+        return _format_amount(
+            float(match.group(1))
+        )
 
-    # 3. origin_price: yuanes.
+    # 3. origin_price.
     match = (
         _ORIGIN_PRICE_ESCAPED_RE.search(page_html)
         or _ORIGIN_PRICE_NORMAL_RE.search(page_html)
     )
 
     if match:
-        return _format_amount(float(match.group(1)))
+        return _format_amount(
+            float(match.group(1))
+        )
 
     return ""
 
 
 def _extract_images(page_html: str) -> list[str]:
-    """Extrae únicamente imágenes reales de producto."""
+    """Extrae imágenes reales del producto."""
 
     images: list[str] = []
     seen_keys: set[str] = set()
 
     for match in _IMG_URL_RE.finditer(page_html):
+
         url = match.group(0).split("?")[0]
         url_lower = url.lower()
 
-        # Descarta logos, avatares, iconos y banners.
-        if any(keyword in url_lower for keyword in _JUNK_KEYWORDS):
+        if any(
+            keyword in url_lower
+            for keyword in _JUNK_KEYWORDS
+        ):
             continue
 
-        # Descarta imágenes demasiado pequeñas.
+        # Comprobar dimensiones si están en la URL.
         dim_match = _DIMENSION_SUFFIX_RE.search(url)
 
         if dim_match:
+
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
@@ -248,12 +235,11 @@ def _extract_images(page_html: str) -> list[str]:
             ):
                 continue
 
-        # Evita duplicados.
-        dedup_key = (
-            url_lower[: -len(".webp")]
-            if url_lower.endswith(".webp")
-            else url_lower
-        )
+        # Evitar duplicados.
+        dedup_key = url_lower
+
+        if url_lower.endswith(".webp"):
+            dedup_key = url_lower[:-5]
 
         if dedup_key in seen_keys:
             continue
@@ -265,34 +251,3 @@ def _extract_images(page_html: str) -> list[str]:
             break
 
     return images
-
-
-def _build_name_with_brand(raw_name: str, brand: str) -> str:
-    """
-    Construye el nombre que recibirá el resto del bot.
-
-    Ejemplos:
-
-        raw_name:
-        WeightcottonT-shirtbottominglongsleeve300RR88C
-
-        brand:
-        MAISON MARGIELA
-
-        resultado:
-        MAISON MARGIELA WeightcottonT-shirtbottominglongsleeve300RR88C
-
-    Si no se detecta ninguna marca, devuelve el nombre original.
-    """
-
-    raw_name = html_lib.unescape(raw_name).strip()
-    brand = brand.strip()
-
-    if not brand:
-        return raw_name
-
-    # Evitamos repetir la marca si ya estaba en el nombre.
-    if detect_brand_from_name(raw_name):
-        return raw_name
-
-    return f"{brand} {raw_name}"
