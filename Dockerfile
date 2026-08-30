@@ -2,7 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Dependencias básicas necesarias para Playwright/Chromium
+# Ubicación compartida de los navegadores de Playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Dependencias básicas
 RUN apt-get update && apt-get install -y \
     wget \
     ca-certificates \
@@ -12,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium y todas sus dependencias del sistema
+# Instalar Chromium + dependencias del sistema
 RUN playwright install --with-deps chromium
 
 # Copiar proyecto
@@ -23,11 +26,11 @@ COPY product_processor/ ./product_processor/
 COPY inspect_sugargoo.py ./
 COPY inspect_weidian.py ./
 
-# Crear usuario no-root
+# Crear usuario del bot
 RUN useradd --create-home --shell /bin/bash appuser
 
-# Dar permisos al usuario
-RUN chown -R appuser:appuser /app /home/appuser
+# Dar permisos al usuario sobre el proyecto y Playwright
+RUN chown -R appuser:appuser /app /home/appuser /ms-playwright
 
 USER appuser
 
