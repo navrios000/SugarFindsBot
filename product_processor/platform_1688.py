@@ -15,15 +15,28 @@ from utils.product_data import ProductData
 
 
 _MAX_IMAGES = 9
+_PAGE_TIMEOUT = 15000
+
+
+_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
 
 
 def _clean_price(value: str) -> str:
+    """Extrae un precio numérico."""
+
     if not value:
         return ""
 
     value = value.replace(",", ".")
 
-    match = re.search(r"\d+(?:\.\d+)?", value)
+    match = re.search(
+        r"\d+(?:\.\d+)?",
+        value,
+    )
 
     if not match:
         return ""
@@ -32,8 +45,12 @@ def _clean_price(value: str) -> str:
 
 
 def _clean_image_url(url: str) -> str:
+    """Normaliza una URL de imagen."""
+
     if not url:
         return ""
+
+    url = url.strip()
 
     if url.startswith("//"):
         url = "https:" + url
@@ -42,12 +59,16 @@ def _clean_image_url(url: str) -> str:
 
 
 def _is_product_image(url: str) -> bool:
+    """Comprueba si una imagen parece ser del producto."""
+
     if not url:
         return False
 
     lowered = url.lower()
 
-    if not lowered.startswith(("http://", "https://")):
+    if not lowered.startswith(
+        ("http://", "https://")
+    ):
         return False
 
     junk = (
@@ -60,18 +81,29 @@ def _is_product_image(url: str) -> bool:
         "qrcode",
     )
 
-    return not any(word in lowered for word in junk)
+    return not any(
+        word in lowered
+        for word in junk
+    )
 
 
-def _deduplicate_images(images: list[str]) -> list[str]:
+def _deduplicate_images(
+    images: list[str],
+) -> list[str]:
+    """Elimina imágenes duplicadas."""
+
     result = []
     seen = set()
 
     for image in images:
 
-        image = _clean_image_url(image)
+        image = _clean_image_url(
+            image
+        )
 
-        if not _is_product_image(image):
+        if not _is_product_image(
+            image
+        ):
             continue
 
         key = image.lower()
@@ -89,6 +121,8 @@ def _deduplicate_images(images: list[str]) -> list[str]:
 
 
 def _normalise_url(url: str) -> str:
+    """Normaliza la URL."""
+
     url = url.strip()
 
     parsed = urlparse(url)
@@ -106,46 +140,67 @@ async def _extract_title(page) -> str:
 
     # Open Graph
     try:
+
         title = await page.locator(
             'meta[property="og:title"]'
-        ).get_attribute("content") or ""
+        ).get_attribute(
+            "content"
+        ) or ""
+
     except Exception:
         pass
 
     if title:
+
         return title.strip()
 
     # Meta title
     try:
+
         title = await page.locator(
             'meta[name="title"]'
-        ).get_attribute("content") or ""
+        ).get_attribute(
+            "content"
+        ) or ""
+
     except Exception:
         pass
 
     if title:
+
         return title.strip()
 
     # H1
     try:
+
         title = await page.locator(
             "h1"
         ).first.inner_text(
-            timeout=5000
+            timeout=3000
         )
+
     except Exception:
+
         title = ""
 
     if title:
-        title = re.sub(r"\s+", " ", title).strip()
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
 
         if title:
             return title
 
     # Título HTML
     try:
+
         title = await page.title()
+
     except Exception:
+
         title = ""
 
     return title.strip()
@@ -166,11 +221,15 @@ async def _extract_price(page) -> str:
 
         try:
 
-            locator = page.locator(selector)
+            locator = page.locator(
+                selector
+            )
 
             count = await locator.count()
 
-            for i in range(min(count, 15)):
+            for i in range(
+                min(count, 15)
+            ):
 
                 element = locator.nth(i)
 
@@ -181,15 +240,21 @@ async def _extract_price(page) -> str:
                 if not value:
 
                     try:
+
                         value = await element.inner_text(
-                            timeout=1000
+                            timeout=500
                         )
+
                     except Exception:
+
                         value = ""
 
-                cleaned = _clean_price(value)
+                cleaned = _clean_price(
+                    value
+                )
 
                 if cleaned:
+
                     price = cleaned
                     break
 
@@ -199,8 +264,7 @@ async def _extract_price(page) -> str:
         except Exception:
             continue
 
-    # Último intento: buscar el precio directamente
-    # dentro del HTML renderizado.
+    # Buscar directamente en HTML
     if not price:
 
         try:
@@ -229,6 +293,7 @@ async def _extract_price(page) -> str:
                     )
 
                     if cleaned:
+
                         price = cleaned
                         break
 
@@ -238,7 +303,9 @@ async def _extract_price(page) -> str:
     return price
 
 
-async def _extract_images(page) -> list[str]:
+async def _extract_images(
+    page,
+) -> list[str]:
     """Obtiene las imágenes del producto."""
 
     images = []
@@ -260,6 +327,7 @@ async def _extract_images(page) -> list[str]:
             )
 
             if url:
+
                 images.append(url)
 
     except Exception:
@@ -282,21 +350,25 @@ async def _extract_images(page) -> list[str]:
             )
 
             if not url:
+
                 url = await element.get_attribute(
                     "data-src"
                 )
 
             if not url:
+
                 url = await element.get_attribute(
                     "data-lazy-src"
                 )
 
             if not url:
+
                 url = await element.get_attribute(
                     "data-original"
                 )
 
             if url:
+
                 images.append(url)
 
     except Exception:
@@ -305,7 +377,9 @@ async def _extract_images(page) -> list[str]:
     return images
 
 
-async def fetch(product_url: str) -> ProductData:
+async def fetch(
+    product_url: str,
+) -> ProductData:
     """Obtiene los datos de un producto de 1688."""
 
     product_url = _normalise_url(
@@ -313,6 +387,7 @@ async def fetch(product_url: str) -> ProductData:
     )
 
     if not product_url:
+
         raise ProductFetchError(
             "La URL de 1688 está vacía."
         )
@@ -326,12 +401,7 @@ async def fetch(product_url: str) -> ProductData:
             )
 
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 "
-                    "(KHTML, like Gecko) Version/17.0 "
-                    "Mobile/15E148 Safari/604.1"
-                ),
+                user_agent=_USER_AGENT,
                 locale="zh-CN",
                 viewport={
                     "width": 390,
@@ -348,11 +418,13 @@ async def fetch(product_url: str) -> ProductData:
                 await page.goto(
                     product_url,
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=_PAGE_TIMEOUT,
                 )
 
+                # Antes eran 3 segundos.
+                # Reducimos la espera para acelerar 1688.
                 await page.wait_for_timeout(
-                    3000
+                    1000
                 )
 
                 # -------------------------------------------------
@@ -379,7 +451,6 @@ async def fetch(product_url: str) -> ProductData:
                     page
                 )
 
-                # Eliminamos duplicados y basura.
                 images = _deduplicate_images(
                     images
                 )
@@ -388,17 +459,15 @@ async def fetch(product_url: str) -> ProductData:
                 # 1688
                 # -------------------------------------------------
                 #
-                # Las primeras 4 imágenes que devuelve
-                # 1688 corresponden a elementos de la interfaz
-                # y no al producto.
+                # Las primeras 4 imágenes son elementos
+                # de la interfaz de 1688.
                 #
-                # Las eliminamos directamente.
-                # Si quedan menos imágenes, no pasa nada.
+                # Las eliminamos siempre.
                 # -------------------------------------------------
 
                 images = images[4:]
 
-                # Máximo de 9 imágenes para el FIND.
+                # Máximo 9 imágenes.
                 images = images[:_MAX_IMAGES]
 
                 # -------------------------------------------------
@@ -406,15 +475,17 @@ async def fetch(product_url: str) -> ProductData:
                 # -------------------------------------------------
 
                 if not title:
+
                     raise ProductFetchError(
-                        "No se pudo obtener el nombre del producto "
-                        "de 1688."
+                        "No se pudo obtener el nombre "
+                        "del producto de 1688."
                     )
 
                 if not price:
+
                     raise ProductFetchError(
-                        "No se pudo obtener el precio del producto "
-                        "de 1688."
+                        "No se pudo obtener el precio "
+                        "del producto de 1688."
                     )
 
                 return ProductData(
