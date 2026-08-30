@@ -1,4 +1,4 @@
-```python
+
 """Adaptador de Weidian.
 
 Obtiene nombre, precio e imágenes de un producto de Weidian
@@ -593,4 +593,4 @@ async def fetch(product_url: str) -> ProductData:
         raise ProductFetchError(
             f"Error al obtener el producto de Weidian: {e}"
         ) from e
-```
+
