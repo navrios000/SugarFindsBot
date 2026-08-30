@@ -1,3 +1,4 @@
+```python
 """Adaptador de Weidian.
 
 Obtiene nombre, precio e imágenes de un producto de Weidian
@@ -399,15 +400,14 @@ async def _extract_images(page) -> list[str]:
     # WEIDIAN
     # -------------------------------------------------
     #
-    # Las últimas 4 imágenes suelen ser imágenes
-    # que no queremos publicar.
+    # Eliminamos únicamente la primera imagen.
     #
-    # Si hay 4 o menos, conservamos todas para
-    # asegurarnos de que siempre haya fotos.
+    # Si solo existe una imagen, la conservamos para
+    # garantizar que siempre se publique al menos una.
     #
 
-    if len(images) > 4:
-        images = images[:-4]
+    if len(images) > 1:
+        images = images[1:]
 
     return images
 
@@ -593,3 +593,4 @@ async def fetch(product_url: str) -> ProductData:
         raise ProductFetchError(
             f"Error al obtener el producto de Weidian: {e}"
         ) from e
+```
