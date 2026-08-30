@@ -405,7 +405,7 @@ async def fetch(
                 # las imágenes finales.
                 # -----------------------------------------
 
-                images = images[4:]
+                images = images[5:]
 
                 # Máximo 9 imágenes.
                 images = images[:_MAX_IMAGES]
