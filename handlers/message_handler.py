@@ -1,12 +1,17 @@
 """Handler de mensajes: detecta enlaces, genera el FIND y lo publica."""
 
+import asyncio
 import logging
 
 from telegram import InputMediaPhoto, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 from product_processor.base import ProductFetchError
-from product_processor.dispatcher import UnsupportedPlatformError, process
+from product_processor.dispatcher import (
+    UnsupportedPlatformError,
+    process,
+)
 
 from utils.affiliate import (
     build_sugargoo_url,
@@ -24,12 +29,195 @@ logger = logging.getLogger("sugarfinds")
 CHANNEL_ID = -1004404116341
 
 
+# ---------------------------------------------------------------------------
+# CONFIGURACIÓN DE TIMEOUTS
+# ---------------------------------------------------------------------------
+
+# Tiempo máximo permitido para procesar un producto completo.
+PRODUCT_PROCESS_TIMEOUT = 180
+
+# Número máximo de intentos para enviar un FIND.
+TELEGRAM_SEND_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# ENVÍO ROBUSTO DE MEDIA GROUP
+# ---------------------------------------------------------------------------
+
+async def send_media_group_with_retry(
+    bot,
+    chat_id,
+    media,
+):
+    """
+    Envía un álbum a Telegram con reintentos ante errores de red/timeout.
+    """
+
+    last_error = None
+
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+
+        try:
+
+            logger.info(
+                "Enviando media group a Telegram "
+                "(intento %d/%d)",
+                attempt,
+                TELEGRAM_SEND_RETRIES,
+            )
+
+            result = await bot.send_media_group(
+                chat_id=chat_id,
+                media=media,
+            )
+
+            logger.info(
+                "Media group enviado correctamente "
+                "en intento %d",
+                attempt,
+            )
+
+            return result
+
+        except RetryAfter as e:
+
+            last_error = e
+
+            wait_seconds = max(
+                1,
+                int(e.retry_after),
+            )
+
+            logger.warning(
+                "Telegram pidió esperar %ss "
+                "antes de volver a intentar.",
+                wait_seconds,
+            )
+
+            await asyncio.sleep(
+                wait_seconds
+            )
+
+        except (TimedOut, NetworkError) as e:
+
+            last_error = e
+
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                break
+
+            wait_seconds = 3 * attempt
+
+            logger.warning(
+                "Timeout/error de red enviando "
+                "media group: %s. "
+                "Reintentando en %ss...",
+                e,
+                wait_seconds,
+            )
+
+            await asyncio.sleep(
+                wait_seconds
+            )
+
+        except Exception:
+            raise
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "No se pudo enviar el media group."
+    )
+
+
+# ---------------------------------------------------------------------------
+# ENVÍO ROBUSTO DE MENSAJES
+# ---------------------------------------------------------------------------
+
+async def send_message_with_retry(
+    bot,
+    chat_id,
+    text,
+    parse_mode=None,
+):
+    """
+    Envía un mensaje de Telegram con reintentos.
+    """
+
+    last_error = None
+
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+
+        try:
+
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+
+        except RetryAfter as e:
+
+            last_error = e
+
+            wait_seconds = max(
+                1,
+                int(e.retry_after),
+            )
+
+            logger.warning(
+                "Telegram pidió esperar %ss "
+                "antes de enviar el mensaje.",
+                wait_seconds,
+            )
+
+            await asyncio.sleep(
+                wait_seconds
+            )
+
+        except (TimedOut, NetworkError) as e:
+
+            last_error = e
+
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                break
+
+            wait_seconds = 2 * attempt
+
+            logger.warning(
+                "Timeout/error enviando mensaje "
+                "a Telegram: %s. "
+                "Reintentando en %ss...",
+                e,
+                wait_seconds,
+            )
+
+            await asyncio.sleep(
+                wait_seconds
+            )
+
+        except Exception:
+            raise
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "No se pudo enviar el mensaje."
+    )
+
+
+# ---------------------------------------------------------------------------
+# HANDLER
+# ---------------------------------------------------------------------------
+
 def build_message_handler(config):
 
     async def handle_message(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ):
+
         message = update.message
 
         if not message or not message.text:
@@ -37,9 +225,9 @@ def build_message_handler(config):
 
         user = update.effective_user
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # DIAGNÓSTICO
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         logger.info(
             "MENSAJE RECIBIDO: user_id=%s username=%s texto=%r",
@@ -48,16 +236,18 @@ def build_message_handler(config):
             message.text,
         )
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # COMPROBAR ADMIN
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         if not user or user.id not in config.admin_ids:
+
             logger.info(
                 "Mensaje ignorado de usuario no autorizado "
                 "(user_id=%s)",
                 user.id if user else "desconocido",
             )
+
             return
 
         logger.info(
@@ -65,9 +255,9 @@ def build_message_handler(config):
             user.id,
         )
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # SI ESTAMOS ESPERANDO EL NOMBRE
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         pending_product = context.user_data.get(
             "pending_product"
@@ -78,10 +268,16 @@ def build_message_handler(config):
             name = message.text.strip()
 
             if not name:
-                await message.reply_text(
-                    "❌ El nombre no puede estar vacío. "
-                    "Escribe el nombre que quieres usar."
+
+                await send_message_with_retry(
+                    context.bot,
+                    message.chat_id,
+                    (
+                        "❌ El nombre no puede estar vacío. "
+                        "Escribe el nombre que quieres usar."
+                    ),
                 )
+
                 return
 
             pending_product.name = name
@@ -102,6 +298,10 @@ def build_message_handler(config):
 
             try:
 
+                # -----------------------------------------------------------
+                # FOTOS
+                # -----------------------------------------------------------
+
                 if pending_product.images:
 
                     media = [
@@ -115,21 +315,33 @@ def build_message_handler(config):
                         parse_mode="HTML",
                     )
 
-                    await context.bot.send_media_group(
-                        chat_id=CHANNEL_ID,
-                        media=media,
+                    await send_media_group_with_retry(
+                        context.bot,
+                        CHANNEL_ID,
+                        media,
                     )
+
+                # -----------------------------------------------------------
+                # SIN FOTOS
+                # -----------------------------------------------------------
 
                 else:
 
-                    await context.bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=caption,
+                    await send_message_with_retry(
+                        context.bot,
+                        CHANNEL_ID,
+                        caption,
                         parse_mode="HTML",
                     )
 
-                await message.reply_text(
-                    "✅ FIND publicado en el canal."
+                # -----------------------------------------------------------
+                # CONFIRMACIÓN
+                # -----------------------------------------------------------
+
+                await send_message_with_retry(
+                    context.bot,
+                    message.chat_id,
+                    "✅ FIND publicado en el canal.",
                 )
 
                 logger.info(
@@ -141,21 +353,34 @@ def build_message_handler(config):
             except Exception:
 
                 logger.exception(
-                    "Error al publicar el FIND en el canal "
-                    "para user_id=%s",
+                    "Error al publicar el FIND "
+                    "en el canal para user_id=%s",
                     user.id,
                 )
 
-                await message.reply_text(
-                    "Hubo un error al publicar "
-                    "el FIND en el canal."
-                )
+                try:
+
+                    await send_message_with_retry(
+                        context.bot,
+                        message.chat_id,
+                        (
+                            "❌ Hubo un error al publicar "
+                            "el FIND en el canal."
+                        ),
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "No se pudo enviar siquiera "
+                        "el mensaje de error al usuario."
+                    )
 
             return
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # DETECTAR LINK
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         link_match = find_product_link(
             message.text
@@ -172,26 +397,56 @@ def build_message_handler(config):
             product_url,
         )
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # PROCESAR PRODUCTO
-        # ─────────────────────────────────────────
-        #
-        # IMPORTANTE:
-        # No bloqueamos ninguna plataforma aquí.
-        #
-        # El dispatcher decide qué adaptador utilizar:
-        #
-        # Weidian  -> weidian.py
-        # Taobao   -> taobao.py
-        # 1688     -> platform_1688.py
-        #
+        # -------------------------------------------------------------------
 
         try:
 
-            product = await process(
-                platform,
+            logger.info(
+                "Comenzando procesamiento de producto "
+                "platform=%s",
+                platform.value,
+            )
+
+            # IMPORTANTE:
+            # Si un scraper se queda colgado, nunca podrá ocupar el
+            # procesamiento indefinidamente.
+            product = await asyncio.wait_for(
+                process(
+                    platform,
+                    product_url,
+                ),
+                timeout=PRODUCT_PROCESS_TIMEOUT,
+            )
+
+            logger.info(
+                "Procesamiento terminado correctamente "
+                "platform=%s",
+                platform.value,
+            )
+
+        except asyncio.TimeoutError:
+
+            logger.error(
+                "TIMEOUT procesando producto de %s "
+                "después de %ss: %s",
+                platform.value,
+                PRODUCT_PROCESS_TIMEOUT,
                 product_url,
             )
+
+            await send_message_with_retry(
+                context.bot,
+                message.chat_id,
+                (
+                    "⏱️ El producto ha tardado demasiado "
+                    "en procesarse.\n\n"
+                    "Prueba de nuevo con el enlace."
+                ),
+            )
+
+            return
 
         except UnsupportedPlatformError as e:
 
@@ -200,8 +455,10 @@ def build_message_handler(config):
                 platform.value,
             )
 
-            await message.reply_text(
-                str(e)
+            await send_message_with_retry(
+                context.bot,
+                message.chat_id,
+                str(e),
             )
 
             return
@@ -214,9 +471,14 @@ def build_message_handler(config):
                 e,
             )
 
-            await message.reply_text(
-                f"❌ No pude obtener los datos del producto:\n\n"
-                f"{e}"
+            await send_message_with_retry(
+                context.bot,
+                message.chat_id,
+                (
+                    "❌ No pude obtener los datos "
+                    "del producto:\n\n"
+                    f"{e}"
+                ),
             )
 
             return
@@ -230,16 +492,29 @@ def build_message_handler(config):
                 e,
             )
 
-            await message.reply_text(
-                "❌ Ocurrió un error inesperado "
-                "al procesar el producto."
-            )
+            try:
+
+                await send_message_with_retry(
+                    context.bot,
+                    message.chat_id,
+                    (
+                        "❌ Ocurrió un error inesperado "
+                        "al procesar el producto."
+                    ),
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "No se pudo informar al usuario "
+                    "del error de procesamiento."
+                )
 
             return
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # PRECIO
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         try:
 
@@ -255,16 +530,20 @@ def build_message_handler(config):
                 e,
             )
 
-            await message.reply_text(
-                "❌ No pude convertir el precio "
-                "del producto."
+            await send_message_with_retry(
+                context.bot,
+                message.chat_id,
+                (
+                    "❌ No pude convertir el precio "
+                    "del producto."
+                ),
             )
 
             return
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # ENLACES
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         product.spreadsheet_url = (
             config.spreadsheet_url
@@ -312,9 +591,9 @@ def build_message_handler(config):
                 product_url,
             )
 
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
         # GUARDAR PRODUCTO Y PEDIR NOMBRE
-        # ─────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         context.user_data[
             "pending_product"
@@ -329,12 +608,16 @@ def build_message_handler(config):
             len(product.images),
         )
 
-        await message.reply_text(
-            "🏷️ ¿Qué nombre quieres ponerle al FIND?\n\n"
-            "Escribe exactamente el nombre que quieres "
-            "que aparezca.\n\n"
-            "Ejemplo:\n"
-            "Maison Margiela Weight Cotton T-Shirt"
+        await send_message_with_retry(
+            context.bot,
+            message.chat_id,
+            (
+                "🏷️ ¿Qué nombre quieres ponerle al FIND?\n\n"
+                "Escribe exactamente el nombre que quieres "
+                "que aparezca.\n\n"
+                "Ejemplo:\n"
+                "Maison Margiela Weight Cotton T-Shirt"
+            ),
         )
 
     return handle_message
