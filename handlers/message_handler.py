@@ -1,3 +1,4 @@
+
 """Handler de mensajes: detecta enlaces, genera el FIND y lo publica."""
 
 import logging
@@ -87,6 +88,21 @@ def build_message_handler(config):
             context.user_data.pop(
                 "pending_product",
                 None,
+            )
+
+            # ─────────────────────────────────────
+            # DIAGNÓSTICO DEL PRODUCTO
+            # ─────────────────────────────────────
+
+            logger.info(
+                "PUBLICANDO FIND: user_id=%s | "
+                "usfans_url=%r | sugargoo_url=%r | "
+                "spreadsheet_url=%r | images=%d",
+                user.id if user else None,
+                pending_product.usfans_url,
+                pending_product.sugargoo_url,
+                pending_product.spreadsheet_url,
+                len(pending_product.images or []),
             )
 
             caption = build_find_caption(
@@ -235,6 +251,14 @@ def build_message_handler(config):
             config.usfans_coupon
         )
 
+        logger.info(
+            "ENLACES GENERADOS: user_id=%s | "
+            "usfans_url=%r | sugargoo_url=%r",
+            user.id,
+            product.usfans_url,
+            product.sugargoo_url,
+        )
+
         if not product.usfans_url:
 
             logger.warning(
@@ -260,3 +284,4 @@ def build_message_handler(config):
         )
 
     return handle_message
+
