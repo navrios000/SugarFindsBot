@@ -1,4 +1,4 @@
-"""Limpieza y reconstrucción del nombre de producto."""
+"""Limpieza y reconstrucción de nombres de productos."""
 
 import re
 
@@ -10,6 +10,7 @@ except ImportError:
     _WORDNINJA_AVAILABLE = False
 
 
+# Marcas conocidas.
 BRANDS = {
     "MAISON MARGIELA": ["maisonmargiela", "margiela", "mm6"],
     "STONE ISLAND": ["stoneisland"],
@@ -34,6 +35,46 @@ BRANDS = {
     "BAPE": ["bape", "abathingape"],
 }
 
+
+# Palabras habituales que pueden venir pegadas en los títulos.
+COMMON_WORDS = [
+    "oversized",
+    "longsleeve",
+    "shortsleeve",
+    "tshirt",
+    "shirt",
+    "bottoming",
+    "hoodie",
+    "sweater",
+    "jacket",
+    "pants",
+    "trousers",
+    "jeans",
+    "shorts",
+    "cotton",
+    "weight",
+    "wool",
+    "leather",
+    "denim",
+    "knit",
+    "zipper",
+    "zip",
+    "crewneck",
+    "neck",
+    "polo",
+    "vest",
+    "cardigan",
+    "coat",
+    "windbreaker",
+    "tracksuit",
+    "sneakers",
+    "shoes",
+    "boots",
+    "bag",
+    "cap",
+    "hat",
+]
+
 _STOPWORDS = {
     "the",
     "and",
@@ -50,34 +91,49 @@ _STOPWORDS = {
 _BRACKET_RE = re.compile(r"[【\[\(][^】\)\]]*[】\)\]]")
 _NON_WORD_SEP_RE = re.compile(r"[-_/|]+")
 _MULTI_SPACE_RE = re.compile(r"\s+")
+
 _TRAILING_CODE_RE = re.compile(
     r"([0-9]+[A-Za-z]+[0-9]*|[A-Za-z]+[0-9]+[A-Za-z]*)$"
 )
+
 _CODE_TOKEN_RE = re.compile(
     r"^[A-Za-z]{1,4}\d{2,5}[A-Za-z]{0,3}$|^\d{1,5}[A-Za-z]{1,4}$"
 )
+
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
 _LETTER_DIGIT_RE = re.compile(r"(?<=[A-Za-z])(?=\d)")
 _DIGIT_LETTER_RE = re.compile(r"(?<=\d)(?=[A-Za-z])")
 
 _MAX_DESCRIPTION_WORDS = 6
-_WORDNINJA_MIN_LEN = 10
 
 
 def clean_product_name(raw_name: str) -> str:
-    if not raw_name or not raw_name.strip():
-        return ""
+    """Convierte un nombre basura del proveedor en un nombre legible."""
 
+    if not raw_name or not raw_name.strip():
+        return "PRODUCTO"
+
+    # Limpieza inicial.
     text = _BRACKET_RE.sub(" ", raw_name)
     text = _NON_WORD_SEP_RE.sub(" ", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
 
+    # Eliminar códigos internos finales como RR88C.
     text = _strip_trailing_code(text)
 
+    # Separar camelCase:
+    # WeightCottonTshirt -> Weight Cotton Tshirt
     text = _CAMEL_BOUNDARY_RE.sub(" ", text)
+
+    # Separar letras y números:
+    # Shirt300 -> Shirt 300
     text = _LETTER_DIGIT_RE.sub(" ", text)
     text = _DIGIT_LETTER_RE.sub(" ", text)
+
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
+
+    # Separar palabras conocidas aunque estén pegadas.
+    text = _split_common_words(text)
 
     compact_lower = re.sub(r"[^a-z0-9]", "", raw_name.lower())
 
@@ -87,32 +143,34 @@ def clean_product_name(raw_name: str) -> str:
     words = []
     seen = set()
 
-    for token in text.split(" "):
-        for sub_token in _maybe_split_lowercase_run(token):
-            sub_token = sub_token.strip()
+    for token in text.split():
+        token = token.strip()
 
-            if not sub_token or len(sub_token) <= 1:
-                continue
+        if not token:
+            continue
 
-            if _CODE_TOKEN_RE.match(sub_token):
-                continue
+        if len(token) <= 1:
+            continue
 
-            if sub_token.isdigit():
-                continue
+        if _CODE_TOKEN_RE.match(token):
+            continue
 
-            low = sub_token.lower()
+        if token.isdigit():
+            continue
 
-            if low in _STOPWORDS:
-                continue
+        low = token.lower()
 
-            if low in brand_alias_tokens:
-                continue
+        if low in _STOPWORDS:
+            continue
 
-            if low in seen:
-                continue
+        if low in brand_alias_tokens:
+            continue
 
-            seen.add(low)
-            words.append(sub_token)
+        if low in seen:
+            continue
+
+        seen.add(low)
+        words.append(token)
 
     description = " ".join(words[:_MAX_DESCRIPTION_WORDS])
 
@@ -123,9 +181,44 @@ def clean_product_name(raw_name: str) -> str:
     elif description:
         final = description
     else:
-        final = _MULTI_SPACE_RE.sub(" ", raw_name).strip() or "PRODUCTO"
+        final = "PRODUCTO"
 
     return final.upper()
+
+
+def _split_common_words(text: str) -> str:
+    """Separa palabras habituales que vienen pegadas."""
+
+    result = text
+
+    # Repetimos varias veces para poder separar cadenas como:
+    # Weightcottonshirtbottominglongsleeve
+    changed = True
+
+    while changed:
+        changed = False
+
+        for word in sorted(COMMON_WORDS, key=len, reverse=True):
+            pattern = rf"(?i)(?<![A-Za-z])({re.escape(word)})(?![A-Za-z])"
+
+            # Si ya está separado, no hacer nada.
+            if re.search(pattern, result):
+                continue
+
+            # Buscar la palabra dentro de otra cadena.
+            pattern_inside = rf"(?i)([A-Za-z])({re.escape(word)})([A-Za-z])"
+
+            new_result = re.sub(
+                pattern_inside,
+                r"\1 \2 \3",
+                result,
+            )
+
+            if new_result != result:
+                result = new_result
+                changed = True
+
+    return _MULTI_SPACE_RE.sub(" ", result).strip()
 
 
 def _strip_trailing_code(text: str) -> str:
@@ -140,21 +233,6 @@ def _strip_trailing_code(text: str) -> str:
         return text[:-len(code)]
 
     return text
-
-
-def _maybe_split_lowercase_run(token: str) -> list[str]:
-    if (
-        _WORDNINJA_AVAILABLE
-        and len(token) > _WORDNINJA_MIN_LEN
-        and token.isalpha()
-        and token.islower()
-    ):
-        parts = wordninja.split(token)
-
-        if len(parts) > 1:
-            return parts
-
-    return [token]
 
 
 def _detect_brand(compact_lower_title: str) -> str:
