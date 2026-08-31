@@ -1,9 +1,14 @@
+
 """Adaptador de Taobao.
 
 Obtiene nombre, precio e imágenes de un producto de Taobao
 mediante Playwright.
+
+El adaptador intenta primero obtener los datos estructurados que
+Taobao deja en la página y después utiliza el DOM como respaldo.
 """
 
+import json
 import re
 from urllib.parse import urlparse
 
@@ -15,19 +20,19 @@ from utils.product_data import ProductData
 
 
 _MAX_IMAGES = 9
-_PAGE_TIMEOUT = 30000
+_PAGE_TIMEOUT = 45000
 
 _USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/17.0 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
 def _normalise_url(url: str) -> str:
     """Normaliza la URL de Taobao."""
 
-    url = url.strip()
+    url = (url or "").strip()
 
     if not url:
         return ""
@@ -41,25 +46,50 @@ def _normalise_url(url: str) -> str:
 
 
 def _clean_text(value: str) -> str:
-    """Limpia texto obtenido de Taobao."""
+    """Limpia texto."""
 
     if not value:
         return ""
 
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 def _clean_price(value: str) -> str:
-    """Extrae un precio numérico del texto."""
+    """Normaliza un precio."""
+
+    if value is None:
+        return ""
+
+    value = str(value).strip()
 
     if not value:
         return ""
 
+    # Elimina símbolos monetarios y espacios.
+    value = value.replace("¥", "")
+    value = value.replace("￥", "")
+    value = value.replace("RMB", "")
+    value = value.replace("元", "")
     value = value.replace(",", ".")
 
-    match = re.search(r"\d+(?:\.\d+)?", value)
+    # Evitar números claramente ajenos al precio.
+    match = re.search(r"\d+(?:\.\d{1,2})?", value)
 
     if not match:
+        return ""
+
+    try:
+        number = float(match.group(0))
+
+        # Precios absurdamente grandes suelen ser IDs u otros datos.
+        if number <= 0 or number > 100000:
+            return ""
+
+        # Evitar cosas como 1016302543179.
+        if len(match.group(0).split(".")[0]) > 5:
+            return ""
+
+    except ValueError:
         return ""
 
     return match.group(0)
@@ -71,16 +101,22 @@ def _clean_image_url(url: str) -> str:
     if not url:
         return ""
 
-    url = url.strip()
+    url = str(url).strip()
 
     if url.startswith("//"):
         url = "https:" + url
 
-    return url.split("?")[0]
+    # Algunas respuestas JSON contienen escapes.
+    url = url.replace("\\/", "/")
+
+    # Quitar parámetros de tracking.
+    url = url.split("?")[0]
+
+    return url
 
 
 def _is_product_image(url: str) -> bool:
-    """Comprueba si una URL parece corresponder a una imagen real."""
+    """Determina si una URL parece una imagen de producto."""
 
     if not url:
         return False
@@ -88,6 +124,16 @@ def _is_product_image(url: str) -> bool:
     lowered = url.lower()
 
     if not lowered.startswith(("http://", "https://")):
+        return False
+
+    valid_domains = (
+        "alicdn.com",
+        "taobao.com",
+        "tbcdn.cn",
+        "tmall.com",
+    )
+
+    if not any(domain in lowered for domain in valid_domains):
         return False
 
     junk = (
@@ -100,31 +146,22 @@ def _is_product_image(url: str) -> bool:
         "qrcode",
         "seller",
         "shop",
+        "default",
     )
 
     if any(word in lowered for word in junk):
-        return False
-
-    valid_domains = (
-        "alicdn.com",
-        "taobao.com",
-        "tbcdn.cn",
-    )
-
-    if not any(domain in lowered for domain in valid_domains):
         return False
 
     return True
 
 
 def _deduplicate_images(images: list[str]) -> list[str]:
-    """Elimina imágenes duplicadas y limita la cantidad."""
+    """Elimina duplicados y limita el número de imágenes."""
 
     result: list[str] = []
     seen: set[str] = set()
 
     for image in images:
-
         image = _clean_image_url(image)
 
         if not _is_product_image(image):
@@ -144,13 +181,11 @@ def _deduplicate_images(images: list[str]) -> list[str]:
     return result
 
 
-async def _get_meta_content(page, property_name: str) -> str:
-    """Obtiene el contenido de una etiqueta meta."""
+async def _get_meta_content(page, selector: str) -> str:
+    """Obtiene el content de una meta."""
 
     try:
-        locator = page.locator(
-            f'meta[property="{property_name}"]'
-        ).first
+        locator = page.locator(selector).first
 
         if await locator.count():
             value = await locator.get_attribute("content")
@@ -165,52 +200,77 @@ async def _get_meta_content(page, property_name: str) -> str:
 
 
 async def _extract_title(page) -> str:
-    """Extrae el nombre del producto usando varios métodos."""
+    """Extrae el nombre del producto."""
 
-    # 1. Open Graph
-    title = await _get_meta_content(
-        page,
-        "og:title",
-    )
-
-    if title:
-        return title
-
-    # 2. Meta title / description
+    # Open Graph.
     for selector in (
+        'meta[property="og:title"]',
         'meta[name="title"]',
-        'meta[name="description"]',
     ):
-        try:
-            locator = page.locator(selector).first
+        value = await _get_meta_content(page, selector)
 
-            if await locator.count():
-                value = await locator.get_attribute("content")
+        if value:
+            return value
 
-                if value:
-                    value = _clean_text(value)
-
-                    if value:
-                        return value
-
-        except Exception:
-            continue
-
-    # 3. H1
+    # JSON-LD.
     try:
-        h1 = page.locator("h1").first
+        scripts = page.locator(
+            'script[type="application/ld+json"]'
+        )
 
-        if await h1.count():
-            value = await h1.inner_text(timeout=5000)
-            value = _clean_text(value)
+        count = await scripts.count()
 
-            if value:
-                return value
+        for index in range(min(count, 20)):
+            text = await scripts.nth(index).text_content()
+
+            if not text:
+                continue
+
+            try:
+                data = json.loads(text)
+
+            except Exception:
+                continue
+
+            objects = data if isinstance(data, list) else [data]
+
+            for obj in objects:
+                if not isinstance(obj, dict):
+                    continue
+
+                name = _clean_text(obj.get("name", ""))
+
+                if name:
+                    return name
 
     except Exception:
         pass
 
-    # 4. Título HTML
+    # Selectores DOM.
+    for selector in (
+        "h1",
+        '[class*="title"]',
+        '[class*="Title"]',
+    ):
+        try:
+            locator = page.locator(selector)
+
+            count = await locator.count()
+
+            for index in range(min(count, 10)):
+                value = _clean_text(
+                    await locator.nth(index).inner_text(
+                        timeout=2000
+                    )
+                )
+
+                if value and len(value) >= 3:
+                    return value
+
+        except Exception:
+            continue
+
+    # Título HTML.
     try:
         value = _clean_text(await page.title())
 
@@ -223,6 +283,7 @@ async def _extract_title(page) -> str:
                 "sign in",
                 "登录",
                 "error",
+                "404",
             )
         ):
             return value
@@ -233,76 +294,180 @@ async def _extract_title(page) -> str:
     return ""
 
 
-async def _extract_price(page) -> str:
-    """Extrae el precio del producto usando varios métodos."""
+def _price_from_json_object(data) -> str:
+    """Busca recursivamente un precio dentro de JSON."""
 
-    # ---------------------------------------------------------
-    # 1. Open Graph
-    # ---------------------------------------------------------
+    if isinstance(data, dict):
 
-    price = await _get_meta_content(
-        page,
-        "product:price:amount",
+        # Preferimos claves que realmente representan precio.
+        preferred_keys = (
+            "currentPrice",
+            "salePrice",
+            "discountPrice",
+            "price",
+            "minPrice",
+            "maxPrice",
+        )
+
+        for key in preferred_keys:
+            if key in data:
+                value = _clean_price(data[key])
+
+                if value:
+                    return value
+
+        for value in data.values():
+            result = _price_from_json_object(value)
+
+            if result:
+                return result
+
+    elif isinstance(data, list):
+
+        for item in data:
+            result = _price_from_json_object(item)
+
+            if result:
+                return result
+
+    return ""
+
+
+async def _extract_price_from_json(page) -> str:
+    """Busca el precio en JSON-LD y scripts de la página."""
+
+    # JSON-LD.
+    try:
+        scripts = page.locator(
+            'script[type="application/ld+json"]'
+        )
+
+        count = await scripts.count()
+
+        for index in range(min(count, 20)):
+
+            text = await scripts.nth(index).text_content()
+
+            if not text:
+                continue
+
+            try:
+                data = json.loads(text)
+
+            except Exception:
+                continue
+
+            price = _price_from_json_object(data)
+
+            if price:
+                return price
+
+    except Exception:
+        pass
+
+    # Scripts de Taobao.
+    try:
+        scripts = page.locator("script")
+
+        count = await scripts.count()
+
+        for index in range(min(count, 150)):
+
+            text = await scripts.nth(index).text_content()
+
+            if not text:
+                continue
+
+            # Solo analizar scripts que parecen contener precios.
+            if not re.search(
+                r"currentPrice|salePrice|discountPrice|price",
+                text,
+                re.IGNORECASE,
+            ):
+                continue
+
+            patterns = (
+                r'"currentPrice"\s*:\s*"([^"]+)"',
+                r'"currentPrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                r'"salePrice"\s*:\s*"([^"]+)"',
+                r'"salePrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                r'"discountPrice"\s*:\s*"([^"]+)"',
+                r'"discountPrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+                r'"price"\s*:\s*"([^"]+)"',
+                r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            )
+
+            for pattern in patterns:
+
+                match = re.search(
+                    pattern,
+                    text,
+                    re.IGNORECASE,
+                )
+
+                if not match:
+                    continue
+
+                price = _clean_price(match.group(1))
+
+                if price:
+                    return price
+
+    except Exception:
+        pass
+
+    return ""
+
+
+async def _extract_price_from_meta(page) -> str:
+    """Extrae el precio desde meta tags."""
+
+    selectors = (
+        'meta[itemprop="price"]',
+        'meta[property="product:price:amount"]',
+        'meta[property="product:price"]',
+        'meta[name="price"]',
     )
 
-    price = _clean_price(price)
-
-    if price:
-        return price
-
-    # ---------------------------------------------------------
-    # 2. Meta tags alternativas
-    # ---------------------------------------------------------
-
-    meta_selectors = [
-        'meta[itemprop="price"]',
-        'meta[name="price"]',
-        'meta[property="product:price"]',
-        'meta[property="product:price:amount"]',
-    ]
-
-    for selector in meta_selectors:
+    for selector in selectors:
 
         try:
-
             locator = page.locator(selector)
 
             count = await locator.count()
 
-            for index in range(min(count, 10)):
+            for index in range(min(count, 20)):
 
                 value = await locator.nth(index).get_attribute(
                     "content"
                 )
 
-                cleaned = _clean_price(value or "")
+                price = _clean_price(value or "")
 
-                if cleaned:
-                    return cleaned
+                if price:
+                    return price
 
         except Exception:
             continue
 
-    # ---------------------------------------------------------
-    # 3. Selectores de precio
-    # ---------------------------------------------------------
+    return ""
 
-    selectors = [
+
+async def _extract_price_from_dom(page) -> str:
+    """Busca el precio visible en el DOM."""
+
+    selectors = (
+        '[itemprop="price"]',
+        '[data-testid*="price"]',
         '[class*="Price--"]',
         '[class*="price--"]',
-        '[class*="Price"]',
-        '[class*="price"]',
         '[class*="PriceText"]',
         '[class*="priceText"]',
-        '[data-testid*="price"]',
-        '[data-spm*="price"]',
-        '[itemprop="price"]',
-    ]
+    )
 
     for selector in selectors:
 
         try:
-
             locator = page.locator(selector)
 
             count = await locator.count()
@@ -311,82 +476,50 @@ async def _extract_price(page) -> str:
 
                 element = locator.nth(index)
 
-                # Primero atributo content
-                value = await element.get_attribute(
-                    "content"
-                )
+                value = await element.get_attribute("content")
 
-                # Después texto visible
+                if not value:
+                    value = await element.get_attribute("data-price")
+
                 if not value:
                     try:
                         value = await element.inner_text(
-                            timeout=1000
+                            timeout=1500
                         )
                     except Exception:
                         value = ""
 
-                cleaned = _clean_price(value or "")
+                price = _clean_price(value or "")
 
-                if cleaned:
-                    return cleaned
+                if price:
+                    return price
 
         except Exception:
             continue
 
-    # ---------------------------------------------------------
-    # 4. JSON / JavaScript de la página
-    # ---------------------------------------------------------
+    return ""
 
-    try:
 
-        html = await page.content()
+async def _extract_price(page) -> str:
+    """Extrae el precio utilizando varias fuentes."""
 
-        patterns = [
+    # 1. Meta.
+    price = await _extract_price_from_meta(page)
 
-            # "price":"29.99"
-            r'"price"\s*:\s*"([\d]+(?:\.[\d]+)?)"',
+    if price:
+        return price
 
-            # "price":29.99
-            r'"price"\s*:\s*([\d]+(?:\.[\d]+)?)',
+    # 2. JSON.
+    price = await _extract_price_from_json(page)
 
-            # "currentPrice":"29.99"
-            r'"currentPrice"\s*:\s*"([\d]+(?:\.[\d]+)?)"',
+    if price:
+        return price
 
-            # "currentPrice":29.99
-            r'"currentPrice"\s*:\s*([\d]+(?:\.[\d]+)?)',
+    # 3. DOM.
+    price = await _extract_price_from_dom(page)
 
-            # "salePrice":"29.99"
-            r'"salePrice"\s*:\s*"([\d]+(?:\.[\d]+)?)"',
-
-            # "salePrice":29.99
-            r'"salePrice"\s*:\s*([\d]+(?:\.[\d]+)?)',
-
-            # "discountPrice":"29.99"
-            r'"discountPrice"\s*:\s*"([\d]+(?:\.[\d]+)?)"',
-
-            # "discountPrice":29.99
-            r'"discountPrice"\s*:\s*([\d]+(?:\.[\d]+)?)',
-        ]
-
-        for pattern in patterns:
-
-            match = re.search(
-                pattern,
-                html,
-                re.IGNORECASE,
-            )
-
-            if match:
-
-                cleaned = _clean_price(
-                    match.group(1)
-                )
-
-                if cleaned:
-                    return cleaned
-
-    except Exception:
-        pass
+    if price:
+        return price
 
     return ""
 
@@ -401,55 +534,115 @@ async def _extract_images(page) -> list[str]:
     # ---------------------------------------------------------
 
     try:
-
-        meta_images = page.locator(
+        locator = page.locator(
             'meta[property="og:image"]'
         )
 
-        count = await meta_images.count()
+        count = await locator.count()
 
         for index in range(count):
-
-            element = meta_images.nth(index)
-
-            url = await element.get_attribute(
+            value = await locator.nth(index).get_attribute(
                 "content"
             )
 
-            if url:
-                images.append(url)
+            if value:
+                images.append(value)
 
     except Exception:
         pass
 
     # ---------------------------------------------------------
-    # Imágenes del DOM
+    # JSON-LD
     # ---------------------------------------------------------
 
     try:
+        scripts = page.locator(
+            'script[type="application/ld+json"]'
+        )
 
-        image_elements = page.locator("img")
+        count = await scripts.count()
 
-        count = await image_elements.count()
+        for index in range(min(count, 20)):
 
-        for index in range(min(count, 100)):
+            text = await scripts.nth(index).text_content()
 
-            element = image_elements.nth(index)
+            if not text:
+                continue
+
+            try:
+                data = json.loads(text)
+
+            except Exception:
+                continue
+
+            objects = data if isinstance(data, list) else [data]
+
+            for obj in objects:
+
+                if not isinstance(obj, dict):
+                    continue
+
+                image = obj.get("image")
+
+                if isinstance(image, str):
+                    images.append(image)
+
+                elif isinstance(image, list):
+                    images.extend(
+                        item
+                        for item in image
+                        if isinstance(item, str)
+                    )
+
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------
+    # DOM
+    # ---------------------------------------------------------
+
+    try:
+        locator = page.locator("img")
+
+        count = await locator.count()
+
+        for index in range(min(count, 150)):
+
+            element = locator.nth(index)
 
             for attribute in (
                 "src",
                 "data-src",
                 "data-lazy-src",
                 "data-original",
+                "data-ks-lazyload",
             ):
 
-                url = await element.get_attribute(
-                    attribute
-                )
+                value = await element.get_attribute(attribute)
 
-                if url:
-                    images.append(url)
+                if value:
+                    images.append(value)
                     break
+
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------
+    # HTML
+    # ---------------------------------------------------------
+
+    # Taobao a veces deja URLs de imágenes en atributos o scripts
+    # aunque todavía no estén representadas como <img>.
+    try:
+        html = await page.content()
+
+        found = re.findall(
+            r'https?:?\\?/\\?/[^"\'\\s<>]+?\.(?:jpg|jpeg|png|webp)',
+            html,
+            re.IGNORECASE,
+        )
+
+        images.extend(found)
 
     except Exception:
         pass
@@ -457,8 +650,61 @@ async def _extract_images(page) -> list[str]:
     return _deduplicate_images(images)
 
 
-async def _debug_taobao(page, title: str, price: str) -> None:
-    """Imprime información útil para diagnosticar Taobao en Render."""
+async def _detect_block(page) -> str:
+    """Detecta bloqueos evidentes."""
+
+    current_url = page.url.lower()
+
+    if (
+        "login.taobao.com" in current_url
+        or "login.tmall.com" in current_url
+    ):
+        return "Taobao redirigió a la página de login."
+
+    try:
+        text = await page.locator("body").inner_text(
+            timeout=5000
+        )
+
+        text = text.lower()
+
+    except Exception:
+        text = ""
+
+    # Solo palabras muy claras.
+    blocked_groups = (
+        (
+            "captcha",
+            "验证码",
+            "安全验证",
+            "滑块验证",
+        ),
+        (
+            "人机验证",
+            "请完成验证",
+            "访问异常",
+        ),
+    )
+
+    for group in blocked_groups:
+
+        if any(word.lower() in text for word in group):
+
+            return (
+                "Taobao mostró una pantalla de "
+                "verificación/anti-bot."
+            )
+
+    return ""
+
+
+async def _debug_taobao(
+    page,
+    title: str,
+    price: str,
+    images: list[str],
+) -> None:
+    """Información de diagnóstico para Render."""
 
     print("")
     print("========== TAOBAO DEBUG ==========")
@@ -474,51 +720,25 @@ async def _debug_taobao(page, title: str, price: str) -> None:
     print("PRICE:")
     print(price)
 
-    # ---------------------------------------------------------
-    # Texto visible
-    # ---------------------------------------------------------
+    print("")
+    print("IMAGES:")
+    print(len(images))
+
+    for image in images:
+        print(image)
 
     try:
-
-        body_text = await page.locator(
-            "body"
-        ).inner_text(
+        body_text = await page.locator("body").inner_text(
             timeout=5000
         )
 
         print("")
         print("========== BODY TEXT ==========")
-        print(body_text[:15000])
+        print(body_text[:12000])
 
     except Exception as e:
-
         print("")
         print("ERROR BODY TEXT:")
-        print(e)
-
-    # ---------------------------------------------------------
-    # Buscar referencias a precios en HTML
-    # ---------------------------------------------------------
-
-    try:
-
-        html = await page.content()
-
-        print("")
-        print("========== HTML PRICE MATCHES ==========")
-
-        matches = re.findall(
-            r'(?i).{0,150}(?:price|precio|价格|¥|￥).{0,250}',
-            html,
-        )
-
-        for match in matches[:50]:
-            print(match)
-
-    except Exception as e:
-
-        print("")
-        print("ERROR HTML DEBUG:")
         print(e)
 
     print("")
@@ -542,131 +762,89 @@ async def fetch(product_url: str) -> ProductData:
 
             browser = await p.chromium.launch(
                 headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
             )
 
             context = await browser.new_context(
                 user_agent=_USER_AGENT,
                 locale="zh-CN",
+                timezone_id="Asia/Shanghai",
                 viewport={
-                    "width": 390,
-                    "height": 844,
+                    "width": 1366,
+                    "height": 900,
                 },
-                is_mobile=True,
-                device_scale_factor=3,
+                is_mobile=False,
+                device_scale_factor=1,
             )
 
             page = await context.new_page()
 
-            # -------------------------------------------------
-            # BLOQUEAR RECURSOS PESADOS
-            # -------------------------------------------------
-
-            async def handle_route(route):
-
-                resource_type = (
-                    route.request.resource_type
-                )
-
-                if resource_type in {
-                    "font",
-                    "media",
-                    "websocket",
-                }:
-                    await route.abort()
-
-                else:
-                    await route.continue_()
-
-            await page.route(
-                "**/*",
-                handle_route,
-            )
-
             try:
+
+                # -------------------------------------------------
+                # CABECERAS
+                # -------------------------------------------------
+
+                await page.set_extra_http_headers(
+                    {
+                        "Accept-Language": (
+                            "zh-CN,zh;q=0.9,en;q=0.8"
+                        ),
+                    }
+                )
 
                 # -------------------------------------------------
                 # ABRIR TAOBAO
                 # -------------------------------------------------
 
-                await page.goto(
+                response = await page.goto(
                     product_url,
                     wait_until="domcontentloaded",
                     timeout=_PAGE_TIMEOUT,
                 )
 
-                # Esperar contenido dinámico
-                await page.wait_for_timeout(5000)
-
-                current_url = page.url.lower()
-
-                # -------------------------------------------------
-                # DETECTAR LOGIN
-                # -------------------------------------------------
-
-                if (
-                    "login.taobao.com" in current_url
-                    or "login.tmall.com" in current_url
-                ):
-                    raise ProductFetchError(
-                        "Taobao redirigió a login. "
-                        "El producto está bloqueado para acceso "
-                        "sin sesión."
+                if response is not None:
+                    print(
+                        "TAOBAO HTTP STATUS:",
+                        response.status,
                     )
 
-                # -------------------------------------------------
-                # DETECTAR CAPTCHA / ANTI-BOT
-                # -------------------------------------------------
+                # Dejar que JavaScript termine de construir
+                # la página del producto.
+                await page.wait_for_timeout(7000)
 
-                page_text = ""
-
+                # Esperar a que exista algo de contenido.
                 try:
-
-                    page_text = (
-                        await page.locator(
-                            "body"
-                        ).inner_text(
-                            timeout=5000
-                        )
-                    ).lower()
-
+                    await page.locator("body").wait_for(
+                        timeout=10000
+                    )
                 except Exception:
                     pass
 
-                blocked_words = (
-                    "captcha",
-                    "verify",
-                    "验证",
-                    "安全验证",
-                    "robot",
-                    "人机",
-                    "滑块",
-                    "异常访问",
-                )
+                # -------------------------------------------------
+                # DETECTAR BLOQUEO
+                # -------------------------------------------------
 
-                if any(
-                    word in page_text
-                    for word in blocked_words
-                ):
+                block_reason = await _detect_block(page)
+
+                if block_reason:
                     raise ProductFetchError(
-                        "Taobao mostró una pantalla de "
-                        "verificación/anti-bot."
+                        block_reason
                     )
 
                 # -------------------------------------------------
-                # EXTRAER DATOS
+                # EXTRAER
                 # -------------------------------------------------
 
-                title = await _extract_title(
-                    page
-                )
+                title = await _extract_title(page)
 
-                price = await _extract_price(
-                    page
-                )
+                price = await _extract_price(page)
 
-                images = await _extract_images(
-                    page
-                )
+                images = await _extract_images(page)
 
                 # -------------------------------------------------
                 # DEBUG
@@ -676,6 +854,7 @@ async def fetch(product_url: str) -> ProductData:
                     page,
                     title,
                     price,
+                    images,
                 )
 
                 # -------------------------------------------------
@@ -695,7 +874,7 @@ async def fetch(product_url: str) -> ProductData:
                     )
 
                 # -------------------------------------------------
-                # PRODUCT DATA
+                # RESULTADO
                 # -------------------------------------------------
 
                 return ProductData(
@@ -725,3 +904,5 @@ async def fetch(product_url: str) -> ProductData:
         raise ProductFetchError(
             f"Error al obtener el producto de Taobao: {e}"
         ) from e
+
+
