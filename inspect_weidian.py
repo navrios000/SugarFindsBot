@@ -1,7 +1,7 @@
 """Script de apoyo para verificar cómo responde Weidian sin sesión
 iniciada — el equivalente a inspect_sugargoo.py, pero para Weidian.
 
-Uso: 
+Uso:  
     python inspect_weidian.py "https://weidian.com/item.html?itemID=XXXXX"
 
 Guarda el HTML crudo en weidian_page.html para poder revisar la
