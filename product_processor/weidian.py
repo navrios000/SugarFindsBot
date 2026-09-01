@@ -1,5 +1,5 @@
 """Adaptador de Weidian.
-
+ 
 Obtiene nombre, precio e imágenes de un producto de Weidian.
 """
 
