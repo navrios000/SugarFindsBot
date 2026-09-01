@@ -1,4 +1,3 @@
-
 """Adaptador de 1688.
 
 Obtiene nombre, precio e imágenes de un producto de 1688
@@ -52,10 +51,7 @@ def _clean_price(value: str) -> str:
 
     value = value.replace(",", ".")
 
-    match = re.search(
-        r"\d+(?:\.\d+)?",
-        value,
-    )
+    match = re.search(r"\d+(?:\.\d+)?", value)
 
     if not match:
         return ""
@@ -85,11 +81,10 @@ def _is_product_image(url: str) -> bool:
 
     lowered = url.lower()
 
-    if not lowered.startswith(
-        ("http://", "https://")
-    ):
+    if not lowered.startswith(("http://", "https://")):
         return False
 
+    # Elementos habituales de interfaz.
     junk = (
         "logo",
         "avatar",
@@ -98,18 +93,48 @@ def _is_product_image(url: str) -> bool:
         "sprite",
         "loading",
         "qrcode",
+        "qr-code",
+        "placeholder",
+        "default",
+        "banner",
+        "ad.",
+        "ads.",
+        "advert",
+        "recommend",
+        "shop",
+        "seller",
+        "store",
     )
 
-    return not any(
-        word in lowered
-        for word in junk
+    if any(word in lowered for word in junk):
+        return False
+
+    # No aceptar SVG como foto de producto.
+    if lowered.endswith(".svg"):
+        return False
+
+    return True
+
+
+def _image_key(url: str) -> str:
+    """Genera una clave para detectar duplicados."""
+
+    cleaned = _clean_image_url(url).lower()
+
+    # 1688 puede servir la misma imagen con diferentes
+    # parámetros de tamaño.
+    cleaned = re.sub(
+        r"[_-]\d+x\d+(?=\.(?:jpg|jpeg|png|webp)$)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
     )
 
+    return cleaned
 
-def _deduplicate_images(
-    images: list[str],
-) -> list[str]:
-    """Elimina imágenes duplicadas."""
+
+def _deduplicate_images(images: list[str]) -> list[str]:
+    """Elimina imágenes duplicadas y basura evidente."""
 
     result = []
     seen = set()
@@ -121,7 +146,7 @@ def _deduplicate_images(
         if not _is_product_image(image):
             continue
 
-        key = image.lower()
+        key = _image_key(image)
 
         if key in seen:
             continue
@@ -135,7 +160,6 @@ def _deduplicate_images(
 async def _extract_title(page) -> str:
     """Obtiene el nombre del producto."""
 
-    # 1. Open Graph
     try:
         title = await page.locator(
             'meta[property="og:title"]'
@@ -147,7 +171,6 @@ async def _extract_title(page) -> str:
     except Exception:
         pass
 
-    # 2. Meta title
     try:
         title = await page.locator(
             'meta[name="title"]'
@@ -159,19 +182,12 @@ async def _extract_title(page) -> str:
     except Exception:
         pass
 
-    # 3. H1
     try:
-        title = await page.locator(
-            "h1"
-        ).first.inner_text(
+        title = await page.locator("h1").first.inner_text(
             timeout=3000
         )
 
-        title = re.sub(
-            r"\s+",
-            " ",
-            title,
-        ).strip()
+        title = re.sub(r"\s+", " ", title).strip()
 
         if title:
             return title
@@ -179,7 +195,6 @@ async def _extract_title(page) -> str:
     except Exception:
         pass
 
-    # 4. Título HTML
     try:
         title = await page.title()
 
@@ -205,18 +220,13 @@ async def _extract_price(page) -> str:
 
         try:
             locator = page.locator(selector)
-
             count = await locator.count()
 
-            for index in range(
-                min(count, 15)
-            ):
+            for index in range(min(count, 15)):
 
                 element = locator.nth(index)
 
-                value = await element.get_attribute(
-                    "content"
-                )
+                value = await element.get_attribute("content")
 
                 if not value:
                     try:
@@ -226,9 +236,7 @@ async def _extract_price(page) -> str:
                     except Exception:
                         value = ""
 
-                price = _clean_price(
-                    value or ""
-                )
+                price = _clean_price(value or "")
 
                 if price:
                     return price
@@ -236,7 +244,6 @@ async def _extract_price(page) -> str:
         except Exception:
             continue
 
-    # Buscar precio directamente en el HTML.
     try:
         html = await page.content()
 
@@ -256,9 +263,7 @@ async def _extract_price(page) -> str:
             )
 
             if match:
-                price = _clean_price(
-                    match.group(1)
-                )
+                price = _clean_price(match.group(1))
 
                 if price:
                     return price
@@ -270,11 +275,14 @@ async def _extract_price(page) -> str:
 
 
 async def _extract_images(page) -> list[str]:
-    """Obtiene las imágenes de producto."""
+    """Obtiene imágenes intentando priorizar la galería del producto."""
 
     images = []
 
-    # Open Graph
+    # ---------------------------------------------------------
+    # 1. Open Graph
+    # ---------------------------------------------------------
+
     try:
         elements = await page.locator(
             'meta[property="og:image"]'
@@ -282,9 +290,7 @@ async def _extract_images(page) -> list[str]:
 
         for element in elements:
 
-            url = await element.get_attribute(
-                "content"
-            )
+            url = await element.get_attribute("content")
 
             if url:
                 images.append(url)
@@ -292,35 +298,50 @@ async def _extract_images(page) -> list[str]:
     except Exception:
         pass
 
-    # Imágenes del DOM
+    # ---------------------------------------------------------
+    # 2. Imágenes visibles del DOM
+    #
+    # Damos prioridad a imágenes realmente visibles.
+    # Las recomendaciones/banners suelen estar fuera de la
+    # zona visible o tener dimensiones muy pequeñas.
+    # ---------------------------------------------------------
+
     try:
-        elements = await page.locator(
-            "img"
-        ).all()
+        elements = await page.locator("img").all()
+
+        visible_images = []
+        other_images = []
 
         for element in elements:
 
-            url = await element.get_attribute(
-                "src"
-            )
+            url = await element.get_attribute("src")
 
             if not url:
-                url = await element.get_attribute(
-                    "data-src"
-                )
+                url = await element.get_attribute("data-src")
 
             if not url:
-                url = await element.get_attribute(
-                    "data-lazy-src"
-                )
+                url = await element.get_attribute("data-lazy-src")
 
             if not url:
-                url = await element.get_attribute(
-                    "data-original"
-                )
+                url = await element.get_attribute("data-original")
 
-            if url:
-                images.append(url)
+            if not url:
+                continue
+
+            try:
+                if await element.is_visible():
+                    visible_images.append(url)
+                else:
+                    other_images.append(url)
+
+            except Exception:
+                other_images.append(url)
+
+        # Las visibles tienen prioridad.
+        images.extend(visible_images)
+
+        # Añadimos las demás solo como respaldo.
+        images.extend(other_images)
 
     except Exception:
         pass
@@ -328,14 +349,10 @@ async def _extract_images(page) -> list[str]:
     return _deduplicate_images(images)
 
 
-async def fetch(
-    product_url: str,
-) -> ProductData:
+async def fetch(product_url: str) -> ProductData:
     """Obtiene los datos de un producto de 1688."""
 
-    product_url = _normalise_url(
-        product_url
-    )
+    product_url = _normalise_url(product_url)
 
     if not product_url:
         raise ProductFetchError(
@@ -371,38 +388,26 @@ async def fetch(
                     timeout=_PAGE_TIMEOUT,
                 )
 
-                # Pequeña espera para que aparezca
-                # el contenido dinámico.
-                await page.wait_for_timeout(
-                    1000
-                )
+                await page.wait_for_timeout(1000)
 
                 # -----------------------------------------
                 # EXTRAER DATOS
                 # -----------------------------------------
 
-                title = await _extract_title(
-                    page
-                )
-
-                price = await _extract_price(
-                    page
-                )
-
-                images = await _extract_images(
-                    page
-                )
+                title = await _extract_title(page)
+                price = await _extract_price(page)
+                images = await _extract_images(page)
 
                 # -----------------------------------------
                 # 1688
                 # -----------------------------------------
                 #
-                # Las 4 primeras imágenes obtenidas
-                # corresponden a elementos de interfaz
-                # de 1688 y NO queremos publicarlas.
+                # Las primeras 5 imágenes obtenidas son
+                # elementos de interfaz de 1688.
                 #
-                # Por eso se eliminan antes de limitar
-                # las imágenes finales.
+                # Se mantiene esta lógica porque en 1688
+                # estamos comprobando que esas 5 primeras
+                # imágenes son basura.
                 # -----------------------------------------
 
                 images = images[5:]
