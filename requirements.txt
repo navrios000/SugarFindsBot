@@ -2,4 +2,4 @@ aiohttp
 python-dotenv
 playwright==1.61.0 
 python-telegram-bot==22.5
-wordninja
+wordninja 
